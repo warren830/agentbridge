@@ -1,0 +1,12 @@
+{
+  "name": "agentbridge",
+  "version": "0.1.0",
+  "description": "Bridge Claude Code to your favorite chat apps",
+  "bin": {
+    "agentbridge": "run.js"
+  },
+  "scripts": {
+    "postinstall": "node install.js"
+  },
+  "license": "MIT"
+}

@@ -1,0 +1,7 @@
+{
+  "task_id": "task-tmux-backend",
+  "task_description": "Implement backend: tmux feature so agentbridge can control an existing Claude Code interactive process running in a tmux session via send-keys and capture-pane, instead of spawning a new subprocess",
+  "status": "in_progress",
+  "feature_order": ["FEAT-001"],
+  "blocked_reason": null
+}

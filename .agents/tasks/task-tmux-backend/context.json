@@ -1,0 +1,24 @@
+{
+  "project_type": "Rust async daemon (tokio) that bridges AI agent backends to chat platforms",
+  "language": "Rust",
+  "build_system": "cargo (no extra build script needed)",
+  "test_framework": "cargo test with integration tests in tests/ directory",
+  "build_command": "cargo check",
+  "test_command": "cargo test",
+  "verification_instructions": "Run cargo check after edits, cargo test before claiming done",
+  "snapshot_or_generated_files": null,
+  "setup_instructions": "cargo check to verify baseline compiles",
+  "environment_constraints": "No new dependencies allowed in Cargo.toml. Use tokio::process::Command for all tmux subprocess calls. No unsafe. All I/O must be async.",
+  "contribution_requirements": "Follow CLAUDE.md: async I/O only (tokio), anyhow::Result at boundaries, tracing for logging, no unsafe, no new deps, cargo check after edits",
+  "key_patterns": "AgentSession trait in src/agent/mod.rs defines the contract. ACP session in src/agent/acp/session.rs is the reference pattern. Registry in src/agent/registry.rs dispatches by backend string. Config structs in src/config/mod.rs with serde Deserialize. Events flow through mpsc channel as AgentEvent enum.",
+  "relevant_files": [
+    "src/agent/mod.rs",
+    "src/agent/registry.rs",
+    "src/agent/acp/mod.rs",
+    "src/agent/acp/session.rs",
+    "src/config/mod.rs",
+    "src/core/event.rs",
+    "Cargo.toml"
+  ],
+  "directory_structure": "src/agent/ contains agent backends (acp/, mod.rs with ClaudeSession, registry.rs). src/config/ has all config structs. src/core/ has event.rs (AgentEvent enum), session.rs, platform.rs. src/engine/ routes messages. src/platforms/ has telegram/discord adapters."
+}

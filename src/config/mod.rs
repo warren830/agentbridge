@@ -276,6 +276,7 @@ pub struct AgentEntry {
     pub allowed_tools: Vec<String>,
     pub max_turns: Option<u32>,
     pub acp: Option<AcpConfig>,
+    pub tmux: Option<TmuxConfig>,
 }
 
 impl AgentEntry {
@@ -300,6 +301,18 @@ pub struct AcpConfig {
     pub display_name: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TmuxConfig {
+    /// tmux session name to attach to / create.
+    pub session: String,
+    /// Automatically create the tmux session and start claude on daemon start.
+    #[serde(default = "default_true")]
+    pub auto_start: bool,
+    /// Automatically restart claude if it exits.
+    #[serde(default = "default_true")]
+    pub auto_restart: bool,
+}
+
 fn default_backend_claude() -> String {
     "claude".to_string()
 }
@@ -317,6 +330,7 @@ impl ProjectConfig {
             allowed_tools: self.agent.allowed_tools.clone(),
             max_turns: self.agent.max_turns,
             acp: None,
+            tmux: None,
         }]
     }
 
@@ -442,6 +456,13 @@ fn validate_agents(project: &ProjectConfig) -> Result<()> {
             if entry.backend == "acp" && entry.acp.is_none() {
                 anyhow::bail!(
                     "Project '{}': agent '{}' has backend 'acp' but no 'acp:' config",
+                    project.name,
+                    entry.name
+                );
+            }
+            if entry.backend == "tmux" && entry.tmux.is_none() {
+                anyhow::bail!(
+                    "Project '{}': agent '{}' has backend 'tmux' but no 'tmux:' config",
                     project.name,
                     entry.name
                 );
@@ -864,6 +885,7 @@ projects:
             allowed_tools: vec!["tool1".into()],
             max_turns: Some(30),
             acp: None,
+            tmux: None,
         };
         let config = entry.to_agent_config();
         assert_eq!(config.mode, "yolo");

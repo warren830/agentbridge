@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use crate::config::{AgentConfig, AgentEntry};
 
 use super::acp::AcpAgent;
+use super::tmux::TmuxAgent;
 use super::{AgentSession, ClaudeAgent};
 
 /// Spawn an agent session for the given entry.
@@ -46,8 +47,17 @@ pub async fn start_session_for_entry(
                 .await?;
             Ok(Box::new(session))
         }
+        "tmux" => {
+            let tmux_config = entry
+                .tmux
+                .clone()
+                .ok_or_else(|| anyhow!("agent '{}' has backend=tmux but no tmux config", entry.name))?;
+            let agent = TmuxAgent::new(work_dir, tmux_config, project_name.to_string());
+            let session = agent.start_session().await?;
+            Ok(Box::new(session))
+        }
         other => Err(anyhow!(
-            "unknown agent backend: '{}' (valid: claude, acp)",
+            "unknown agent backend: '{}' (valid: claude, acp, tmux)",
             other
         )),
     }
@@ -68,6 +78,7 @@ mod tests {
             allowed_tools: vec![],
             max_turns: None,
             acp: None,
+            tmux: None,
         };
         let res = start_session_for_entry(
             &entry,
@@ -93,6 +104,7 @@ mod tests {
             allowed_tools: vec![],
             max_turns: None,
             acp: None,
+            tmux: None,
         };
         let res = start_session_for_entry(
             &entry,
@@ -124,6 +136,7 @@ mod tests {
                 auth_method: None,
                 display_name: None,
             }),
+            tmux: None,
         };
         let res = start_session_for_entry(
             &entry,

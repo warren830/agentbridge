@@ -1,0 +1,31 @@
+{
+  "id": "FEAT-001",
+  "type": "feat",
+  "description": "Add TmuxConfig to config and TmuxSession implementation of AgentSession trait, register tmux backend in registry",
+  "status": "in_progress",
+  "steps": [
+    "1. In src/config/mod.rs, add TmuxConfig struct with fields: session (String), auto_start (bool, default true), auto_restart (bool, default true). Use serde defaults for the booleans.",
+    "2. In src/config/mod.rs, add `pub tmux: Option<TmuxConfig>` field to the AgentEntry struct. Also add a validation rule in validate_agents(): if entry.backend == 'tmux' && entry.tmux.is_none(), bail with error similar to acp validation.",
+    "3. Create src/agent/tmux/mod.rs with: pub mod session; pub use session::{TmuxAgent, TmuxSession};",
+    "4. In src/agent/mod.rs, add `pub mod tmux;` after the existing `pub mod acp;` line.",
+    "5. Create src/agent/tmux/session.rs implementing TmuxSession struct that implements AgentSession trait. Key design: (a) TmuxSession holds: session_name (String), events_rx (mpsc::Receiver<AgentEvent>), event_tx (mpsc::Sender<AgentEvent>), alive (Arc<AtomicBool>), last_output (Arc<Mutex<Vec<String>>>) to track previously seen lines, poll_handle (tokio::task::JoinHandle for the background capture loop). (b) send() executes `tmux send-keys -t <session> -- <escaped_text> Enter` using tokio::process::Command. Text must be escaped for tmux (replace single quotes, backslashes, semicolons). (c) send_with_attachments() just calls send() with the prompt text (tmux cannot send binary attachments). (d) A background polling task runs every 150ms calling `tmux capture-pane -t <session> -p -S -100`, diffs output against last_output to find new lines, and emits AgentEvent::Text for new content. Detect Claude Code result state (prompt waiting pattern like a line ending with '>' or '$' after content) to emit AgentEvent::Result. Detect permission patterns (lines containing 'Allow' and tool permission prompts) to emit AgentEvent::PermissionRequest. (e) respond_permission() sends 'y' Enter or 'n' Enter via tmux send-keys. (f) alive() checks `tmux has-session -t <session>` exit code. (g) close() sends '/exit' Enter or C-c via tmux send-keys. (h) permission_responder() returns Arc<TmuxPermissionResponder> that also uses send-keys. (i) session_id() returns None (tmux sessions don't have agentbridge session IDs). (j) take_events/replace_events/events/drain_stale_events follow the same pattern as AcpSession.",
+    "6. Create TmuxAgent factory struct with fields: work_dir (PathBuf), tmux_config (TmuxConfig), project_name (String). It has start_session() that: checks if tmux session exists (tmux has-session), if not and auto_start is true creates it with `tmux new-session -d -s <name> -c <work_dir>` then `tmux send-keys -t <name> 'claude' Enter`. Then spawns the background poll task, returns TmuxSession.",
+    "7. In src/agent/registry.rs, add a 'tmux' match arm that: extracts entry.tmux config (error if missing), creates TmuxAgent, calls start_session(), returns Box<dyn AgentSession>. Add `use super::tmux::TmuxAgent;` import. Update the error message for unknown backends to include 'tmux' in valid list.",
+    "8. Run cargo check to verify everything compiles."
+  ],
+  "acceptance_criteria": [
+    "cargo check passes with no errors",
+    "cargo test passes (existing tests still work, new code compiles)",
+    "TmuxConfig struct exists with session, auto_start, auto_restart fields",
+    "AgentEntry has tmux: Option<TmuxConfig> field",
+    "TmuxSession implements all AgentSession trait methods",
+    "registry.rs dispatches 'tmux' backend to TmuxAgent",
+    "Validation rejects tmux backend without tmux config"
+  ],
+  "verification": [
+    "cargo check",
+    "cargo test"
+  ],
+  "blocked_reason": null,
+  "findings": ""
+}

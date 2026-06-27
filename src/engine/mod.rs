@@ -123,6 +123,10 @@ pub struct Engine {
     /// Broadcast channel for gateway event forwarding.
     /// Events are sent here so the gateway client can relay them.
     event_broadcast: Arc<tokio::sync::broadcast::Sender<(String, crate::core::event::AgentEvent)>>,
+    /// Routes Claude Code hook events to the matching session's event channel,
+    /// keyed by canonicalized work_dir. Bound when a tmux session starts and
+    /// unbound when it is cleaned up.
+    hook_route: Arc<crate::hook_route::HookRouteRegistry>,
 }
 
 impl Engine {
@@ -189,7 +193,22 @@ impl Engine {
             cron_scheduler,
             skill_registry,
             event_broadcast,
+            hook_route: Arc::new(crate::hook_route::HookRouteRegistry::new()),
         }
+    }
+
+    /// The hook route registry, shared with the hook receiver so inbound hook
+    /// events resolve to this engine's bound sessions.
+    #[allow(dead_code)] // public accessor; main injects a shared registry via set_hook_route
+    pub fn hook_route(&self) -> Arc<crate::hook_route::HookRouteRegistry> {
+        Arc::clone(&self.hook_route)
+    }
+
+    /// Replace this engine's hook route registry with a shared one so a single
+    /// hook receiver can resolve bindings across multiple project engines. Must
+    /// be called before `start()` (before any session can bind).
+    pub fn set_hook_route(&mut self, hook_route: Arc<crate::hook_route::HookRouteRegistry>) {
+        self.hook_route = hook_route;
     }
 
     /// Start all configured platforms with the engine's message handler.
@@ -312,6 +331,7 @@ impl Engine {
             BotCommand { name: "new".into(), description: "New session".into() },
             BotCommand { name: "list".into(), description: "List sessions".into() },
             BotCommand { name: "switch".into(), description: "Switch session".into() },
+            BotCommand { name: "resume".into(), description: "List sessions, or resume one".into() },
             BotCommand { name: "current".into(), description: "Current session info".into() },
             BotCommand { name: "delete".into(), description: "Delete session".into() },
             BotCommand { name: "name".into(), description: "Rename session".into() },
@@ -322,6 +342,7 @@ impl Engine {
             BotCommand { name: "mode".into(), description: "Switch permission mode".into() },
             BotCommand { name: "agent".into(), description: "Switch agent backend".into() },
             BotCommand { name: "dir".into(), description: "Change work directory".into() },
+            BotCommand { name: "attach".into(), description: "Bind channel to a tmux session".into() },
             BotCommand { name: "status".into(), description: "Show status".into() },
             BotCommand { name: "skills".into(), description: "List skills".into() },
             BotCommand { name: "cron".into(), description: "Scheduled tasks".into() },
@@ -376,6 +397,7 @@ impl Engine {
         let cron_scheduler = self.cron_scheduler.clone();
         let skill_registry = self.skill_registry.clone();
         let event_broadcast = self.event_broadcast.clone();
+        let hook_route = self.hook_route.clone();
 
         Arc::new(
             move |platform: Arc<dyn PlatformCapabilities>, msg: IncomingMessage| {
@@ -390,6 +412,7 @@ impl Engine {
                 let cron_scheduler = cron_scheduler.clone();
                 let skill_registry = skill_registry.clone();
                 let event_broadcast = event_broadcast.clone();
+                let hook_route = hook_route.clone();
 
                 tokio::spawn(async move {
                     let reply_ctx = msg.reply_ctx.clone();
@@ -405,6 +428,7 @@ impl Engine {
                         &cron_scheduler,
                         &skill_registry,
                         &event_broadcast,
+                        &hook_route,
                         platform.clone(),
                         msg,
                     )
@@ -451,6 +475,7 @@ async fn handle_message(
     cron_scheduler: &CronScheduler,
     skill_registry: &skills::SkillRegistry,
     event_broadcast: &Arc<tokio::sync::broadcast::Sender<(String, AgentEvent)>>,
+    hook_route: &Arc<crate::hook_route::HookRouteRegistry>,
     platform: Arc<dyn PlatformCapabilities>,
     mut msg: IncomingMessage,
 ) -> Result<()> {
@@ -525,6 +550,7 @@ async fn handle_message(
             mode_override,
             cron_scheduler,
             skill_registry,
+            hook_route,
             platform.clone(),
             &msg,
         )
@@ -689,7 +715,7 @@ async fn handle_message(
                         })
                 };
                 drain_orphaned_queue(
-                    config, sessions, active_agents, interactive_states,
+                    config, sessions, active_agents, interactive_states, hook_route,
                     &session_key, &session, &platform,
                     &effective_model, &effective_mode,
                 ).await;
@@ -711,7 +737,7 @@ async fn handle_message(
             let new_s = sessions.new_session(&session_key, None);
             // Release old lock, cleanup state, re-lock new session
             session.unlock();
-            cleanup_agent_session(interactive_states, &session_key).await;
+            cleanup_agent_session(config, sessions, interactive_states, hook_route, &session_key).await;
             if !new_s.try_lock_explicit() {
                 return Ok(()); // shouldn't happen, but be safe
             }
@@ -764,6 +790,7 @@ async fn handle_message(
         active_agents,
         interactive_states,
         event_broadcast,
+        hook_route,
         &session_key,
         &session,
         &platform,
@@ -792,6 +819,7 @@ async fn process_and_drain(
     active_agents: &Mutex<HashMap<String, String>>,
     interactive_states: &Mutex<HashMap<String, EngineInteractiveState>>,
     event_broadcast: &Arc<tokio::sync::broadcast::Sender<(String, AgentEvent)>>,
+    hook_route: &Arc<crate::hook_route::HookRouteRegistry>,
     session_key: &str,
     session: &Arc<Session>,
     platform: &Arc<dyn PlatformCapabilities>,
@@ -823,6 +851,7 @@ async fn process_and_drain(
     }
 
     let session_work_dir = sessions.get_work_dir(session_key);
+    let session_tmux = sessions.get_tmux_session(session_key);
 
     // Get or create agent session + send the user message + take event rx.
     let rx = {
@@ -850,6 +879,8 @@ async fn process_and_drain(
                 effective_model.as_deref(),
                 &effective_mode,
                 session_work_dir.as_deref(),
+                session_tmux.as_deref(),
+                hook_route,
             )
             .await
             {
@@ -870,10 +901,10 @@ async fn process_and_drain(
         let cs = state.agent_session.as_mut().unwrap();
         cs.drain_stale_events();
 
-        // Inject sender identity into prompt
-        let prompt = build_sender_prompt(&msg.text, &msg.from, platform.name(), session_key);
+        let prompt = msg.text.clone();
 
         // Send initial message
+        tracing::info!(session_key, prompt_len = prompt.len(), "sending prompt to agent");
         if let Err(e) = cs.send(&prompt).await {
             tracing::error!(error = %e, "failed to send message to agent");
             if let Some(stop_fn) = stop_typing.take() { stop_fn(); }
@@ -912,10 +943,11 @@ async fn process_and_drain(
 
     // Run the event loop for this turn (pass typing indicator ownership)
     let reply_ctx: &dyn ReplyCtx = msg.reply_ctx.as_ref();
+    let inplace_progress = uses_inplace_tool_progress(active_agents, session_key, config).await;
     let (rx, result) = run_event_loop_and_save(
         platform, reply_ctx, rx, &mut perm_rx, &responder,
         &mut local_approve_all, &pending_flag, &stopped_flag, stop_typing,
-        &config.display, event_broadcast, sessions, session_key,
+        &config.display, event_broadcast, sessions, session_key, inplace_progress,
     ).await;
 
     // If the event loop produced no real result (empty result + channel closed),
@@ -938,10 +970,13 @@ async fn process_and_drain(
             let mut states = interactive_states.lock().await;
             if let Some(state) = states.get_mut(session_key) {
                 let session_work_dir = sessions.get_work_dir(session_key);
+                let session_tmux = sessions.get_tmux_session(session_key);
                 match start_agent_session_for_key(
                     config, active_agents, session_key,
                     None, effective_model.as_deref(), &effective_mode,
                     session_work_dir.as_deref(),
+                    session_tmux.as_deref(),
+                    hook_route,
                 ).await {
                     Ok(cs) => {
                         state.agent_session = Some(cs);
@@ -963,8 +998,7 @@ async fn process_and_drain(
                 if let Some(state) = states.get_mut(session_key) {
                     let cs = state.agent_session.as_mut().unwrap();
                     cs.drain_stale_events();
-                    let prompt = build_sender_prompt(&msg.text, &msg.from, platform.name(), session_key);
-                    cs.send(&prompt).await.is_ok()
+                    cs.send(&msg.text).await.is_ok()
                 } else { false }
             };
 
@@ -1000,6 +1034,7 @@ async fn process_and_drain(
                 let (rx2, _) = run_event_loop_and_save(
                     platform, reply_ctx, rx, &mut perm_rx2, &responder2,
                     &mut aa2, &pf2, &sf2, retry_typing, &config.display, event_broadcast, sessions, session_key,
+                    inplace_progress,
                 ).await;
 
                 local_approve_all = aa2;
@@ -1071,7 +1106,7 @@ async fn process_and_drain(
 
     // Drain any messages queued while this turn was running.
     drain_pending_messages(
-        config, sessions, active_agents, interactive_states, event_broadcast, session_key, session, platform,
+        config, sessions, active_agents, interactive_states, event_broadcast, hook_route, session_key, session, platform,
         &effective_model, &effective_mode,
     ).await;
 
@@ -1096,8 +1131,9 @@ async fn run_event_loop_and_save(
     event_broadcast: &Arc<tokio::sync::broadcast::Sender<(String, AgentEvent)>>,
     sessions: &SessionManager,
     session_key: &str,
+    tool_progress_inplace: bool,
 ) -> (tokio::sync::mpsc::Receiver<AgentEvent>, Option<events::EventLoopResult>) {
-    match events::process_agent_events(platform, reply_ctx, &mut rx, perm_rx, responder, approve_all, pending_flag, stopped_flag, stop_typing, display, event_broadcast, session_key).await {
+    match events::process_agent_events(platform, reply_ctx, &mut rx, perm_rx, responder, approve_all, pending_flag, stopped_flag, stop_typing, display, event_broadcast, session_key, tool_progress_inplace).await {
         Ok(result) => {
             // Save agent session ID for resume (but never persist the
             // __continue__ sentinel).
@@ -1148,6 +1184,7 @@ async fn drain_pending_messages(
     active_agents: &Mutex<HashMap<String, String>>,
     interactive_states: &Mutex<HashMap<String, EngineInteractiveState>>,
     event_broadcast: &Arc<tokio::sync::broadcast::Sender<(String, AgentEvent)>>,
+    hook_route: &Arc<crate::hook_route::HookRouteRegistry>,
     session_key: &str,
     session: &Arc<Session>,
     platform: &Arc<dyn PlatformCapabilities>,
@@ -1200,6 +1237,7 @@ async fn drain_pending_messages(
         if !alive {
             tracing::warn!(session_key, "drain: agent session dead, recreating");
             let session_work_dir = sessions.get_work_dir(session_key);
+            let session_tmux = sessions.get_tmux_session(session_key);
             // Read from SessionManager (authoritative), not stale cached Arc
             let agent_session_id = sessions.get_agent_session_id(session_key);
             match start_agent_session_for_key(
@@ -1210,6 +1248,8 @@ async fn drain_pending_messages(
                 effective_model.as_deref(),
                 effective_mode,
                 session_work_dir.as_deref(),
+                session_tmux.as_deref(),
+                hook_route,
             ).await {
                 Ok(new_session) => {
                     let mut states = interactive_states.lock().await;
@@ -1253,8 +1293,7 @@ async fn drain_pending_messages(
             // Drain stale events before starting next turn
             cs.drain_stale_events();
 
-            let queued_prompt = build_sender_prompt(&queued.text, &queued.from, platform.name(), session_key);
-            if let Err(e) = cs.send(&queued_prompt).await {
+            if let Err(e) = cs.send(&queued.text).await {
                 tracing::error!(error = %e, "drain: failed to send queued message");
                 let _ = platform.reply(queued.reply_ctx.as_ref(), &format!("💥 发送排队消息失败: {}", e)).await;
                 session.unlock();
@@ -1296,10 +1335,11 @@ async fn drain_pending_messages(
 
         // Process event loop for this queued message
         let reply_ctx: &dyn ReplyCtx = queued.reply_ctx.as_ref();
+        let inplace_progress = uses_inplace_tool_progress(active_agents, session_key, config).await;
         let (rx, _result) = run_event_loop_and_save(
             platform, reply_ctx, rx, &mut perm_rx, &responder,
             &mut local_approve_all, &pending_flag, &stopped_flag, queued_stop_typing,
-            &config.display, event_broadcast, sessions, session_key,
+            &config.display, event_broadcast, sessions, session_key, inplace_progress,
         ).await;
 
         // Store back approve_all and clear perm state
@@ -1326,6 +1366,7 @@ async fn drain_orphaned_queue(
     sessions: &SessionManager,
     active_agents: &Mutex<HashMap<String, String>>,
     interactive_states: &Mutex<HashMap<String, EngineInteractiveState>>,
+    hook_route: &Arc<crate::hook_route::HookRouteRegistry>,
     session_key: &str,
     session: &Arc<Session>,
     platform: &Arc<dyn PlatformCapabilities>,
@@ -1353,7 +1394,7 @@ async fn drain_orphaned_queue(
     // Delegate to drain_pending_messages which handles the race-free unlock.
     drain_pending_messages(
         config, sessions, active_agents, interactive_states, &Arc::new(tokio::sync::broadcast::channel(1).0),
-        session_key, session, platform,
+        hook_route, session_key, session, platform,
         effective_model, effective_mode,
     ).await;
 }
@@ -1504,9 +1545,23 @@ async fn notify_dropped_queue(
 /// Without this, the stale `Arc<Session>` in EngineInteractiveState would
 /// still hold the old agent_session_id even after SessionManager was updated.
 async fn cleanup_agent_session(
+    config: &ProjectConfig,
+    sessions: &SessionManager,
     interactive_states: &Mutex<HashMap<String, EngineInteractiveState>>,
+    hook_route: &crate::hook_route::HookRouteRegistry,
     session_key: &str,
 ) {
+    // Unbind this session's hook route so a hook arriving after teardown is no
+    // longer relayed (and stops holding a stale sender). Use the same work_dir
+    // resolution the bind site uses: per-channel /dir override, else the
+    // project default. Also unbind the tmux session name when this session has
+    // one recorded (set on /attach), mirroring the two-key bind.
+    let work_dir = sessions
+        .get_work_dir(session_key)
+        .unwrap_or_else(|| config.work_dir.display().to_string());
+    let tmux_session = sessions.get_tmux_session(session_key);
+    hook_route.unbind(&work_dir, tmux_session.as_deref());
+
     let mut states = interactive_states.lock().await;
     if let Some(state) = states.remove(session_key) {
         // Unlock the session's busy flag so it doesn't stay stuck forever.
@@ -1540,6 +1595,7 @@ async fn handle_command_message(
     mode_override: &tokio::sync::Mutex<HashMap<(String, String), String>>,
     cron_scheduler: &CronScheduler,
     skill_registry: &skills::SkillRegistry,
+    hook_route: &crate::hook_route::HookRouteRegistry,
     platform: Arc<dyn PlatformCapabilities>,
     msg: &IncomingMessage,
 ) -> Result<bool> {
@@ -1588,18 +1644,29 @@ async fn handle_command_message(
         return Ok(true);
     }
 
-    // Handle /stop command — signal the event loop to abort, then kill agent
+    // Handle /stop command — abort the CURRENT TURN without destroying the
+    // session. For a per-turn-disposable backend (claude/acp) interrupt()
+    // defaults to close(); for the tmux backend it sends Escape so the shared,
+    // user-owned cc keeps running (killing it on /stop would close the very
+    // session the user shares between phone and computer).
     if cmd == "stop" || cmd == "cancel" {
-        // Signal the running event loop to stop immediately
+        // Signal the running event loop to stop immediately, unlock the session,
+        // and interrupt the agent — all WITHOUT removing the interactive state
+        // or unbinding the hook route, so the session stays bridged.
         {
             let states = interactive_states.lock().await;
             if let Some(state) = states.get(&session_key) {
                 state.stopped.store(true, Ordering::Release);
+                state.session.unlock();
+                if let Some(agent) = state.agent_session.as_ref() {
+                    if let Err(e) = agent.interrupt().await {
+                        tracing::warn!(error = %e, "failed to interrupt agent session");
+                    }
+                }
             }
         }
-        cleanup_agent_session(interactive_states, &session_key).await;
         platform
-            .reply(msg.reply_ctx.as_ref(), "🛑 已停止当前任务")
+            .reply(msg.reply_ctx.as_ref(), "🛑 已中断当前任务")
             .await?;
         return Ok(true);
     }
@@ -1648,9 +1715,9 @@ async fn handle_command_message(
     if let Some(reply_text) = reply {
         // If session or work directory changed, kill the running agent process
         // so the next message spawns a fresh one in the correct context.
-        if matches!(cmd, "new" | "switch" | "delete" | "dir" | "cd") {
+        if matches!(cmd, "new" | "switch" | "delete" | "dir" | "cd" | "attach" | "resume") {
             let session_key = make_session_key(&platform, msg);
-            cleanup_agent_session(interactive_states, &session_key).await;
+            cleanup_agent_session(config, sessions, interactive_states, hook_route, &session_key).await;
         }
         platform.reply(msg.reply_ctx.as_ref(), &reply_text).await?;
         return Ok(true);
@@ -1677,6 +1744,8 @@ async fn start_agent_session_for_key(
     model_override: Option<&str>,
     mode_override: &str,
     work_dir_override: Option<&str>,
+    tmux_session_override: Option<&str>,
+    hook_route: &Arc<crate::hook_route::HookRouteRegistry>,
 ) -> Result<Box<dyn AgentSession>> {
     let agent_name = resolve_active_agent(active_agents, session_key, config).await;
     let entry = config
@@ -1696,8 +1765,29 @@ async fn start_agent_session_for_key(
         model_override,
         mode_opt,
         work_dir_override,
+        session_key,
+        tmux_session_override,
+        hook_route,
     )
     .await
+}
+
+/// Whether this session's active backend relays tool progress in place.
+///
+/// True only for the tmux backend with `hook_relay` on: there PostToolUse
+/// hooks arrive as `ToolUse` events and the event loop coalesces them into a
+/// single in-place-edited progress message. The claude/acp backends keep their
+/// existing per-tool reply, so this is false for them.
+async fn uses_inplace_tool_progress(
+    active_agents: &Mutex<HashMap<String, String>>,
+    session_key: &str,
+    config: &ProjectConfig,
+) -> bool {
+    let agent_name = resolve_active_agent(active_agents, session_key, config).await;
+    config
+        .find_agent(&agent_name)
+        .map(|e| e.backend == "tmux" && e.tmux.as_ref().is_some_and(|t| t.hook_relay))
+        .unwrap_or(false)
 }
 
 /// Resolve the active agent name for a session key, falling back to the
@@ -1857,18 +1947,6 @@ fn contains_banned_word(text: &str, banned_words: &[String]) -> bool {
     banned_words
         .iter()
         .any(|w| lower.contains(&w.to_lowercase()))
-}
-
-/// Prepend sender identity to the prompt so the agent knows who is talking.
-fn build_sender_prompt(content: &str, user_id: &str, platform: &str, session_key: &str) -> String {
-    if user_id.is_empty() || user_id == "cron" {
-        return content.to_string();
-    }
-    let chat_id = session_key.split_once(':').map(|x| x.1).unwrap_or("");
-    format!(
-        "[agentbridge sender_id={} platform={} chat_id={}]\n{}",
-        user_id, platform, chat_id, content
-    )
 }
 
 /// Build a prompt string from the incoming message, including image

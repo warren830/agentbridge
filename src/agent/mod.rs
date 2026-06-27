@@ -86,6 +86,19 @@ pub trait AgentSession: Send + Sync {
     /// Whether the agent process is still alive.
     fn alive(&self) -> bool;
 
+    /// Interrupt the current turn WITHOUT destroying the session.
+    ///
+    /// This backs `/stop`. The default is `close()`, which is correct for
+    /// backends whose session is a per-turn-disposable subprocess (claude
+    /// `--print`, ACP): the next message simply spawns a fresh one. A backend
+    /// that *attaches* to a long-lived, user-owned session (tmux) must override
+    /// this to merely abort the in-flight turn — destroying the shared session
+    /// on `/stop` would kill the very Claude Code the user is sitting in front
+    /// of, breaking the "phone and computer drive the same cc" contract.
+    async fn interrupt(&self) -> Result<()> {
+        self.close().await
+    }
+
     /// Gracefully close the session.
     async fn close(&self) -> Result<()>;
 }

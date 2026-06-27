@@ -48,6 +48,7 @@ pub async fn dispatch(
         "new" => Some(cmd_new(sessions, session_key, agent_name, args)),
         "list" => Some(cmd_list(sessions, session_key, agent_name)),
         "switch" => Some(cmd_switch(sessions, session_key, args)),
+        "resume" => Some(cmd_resume(sessions, session_key, agent_name, args)),
         "current" => Some(cmd_current(sessions, session_key)),
         "delete" => Some(cmd_delete(sessions, session_key)),
         "model" => Some(cmd_model(config, session_key, agent_name, model_override, args).await),
@@ -57,6 +58,7 @@ pub async fn dispatch(
         "name" | "rename" => Some(cmd_name(sessions, session_key, args)),
         "history" => Some(cmd_history(sessions, session_key)),
         "dir" | "cd" => Some(cmd_dir(config, sessions, session_key, args)),
+        "attach" => Some(cmd_attach(sessions, session_key, args).await),
         "sync" => Some(cmd_sync(config, args)),
         _ => None,
     }
@@ -71,10 +73,11 @@ fn cmd_help(custom_commands: &[CommandConfig]) -> String {
 /new [name] - New session\n\
 /list - List sessions\n\
 /switch <id> - Switch session\n\
+/resume [id] - List sessions, or resume one\n\
 /current - Current session info\n\
 /delete - Delete current session\n\
 /name [name] - Rename current session\n\
-/stop - Stop current task\n\
+/stop - Interrupt current task (keeps the session)\n\
 /compress - Compress context\n\
 /history - Session history\n\
 /btw <msg> - Inject mid-turn message\n\
@@ -85,6 +88,7 @@ fn cmd_help(custom_commands: &[CommandConfig]) -> String {
 /skills - List available skills\n\
 /commands - List custom commands\n\
 /dir [path] - View/change work directory\n\
+/attach [tmux-session] - Bind channel to a tmux session (tmux backend)\n\
 /sync [pull|push] - Sync session\n\
 /status - Show status\n\
 /help - Show help"
@@ -209,6 +213,23 @@ fn cmd_switch(sessions: &SessionManager, key: &str, args: &str) -> String {
         }
         n => format!("Matched {} sessions, please provide a more specific ID.", n),
     }
+}
+
+/// `/resume` — mirrors Claude CLI's resume flow over agentbridge's session
+/// model. With no argument it lists sessions (so the user can pick one); with
+/// an argument it switches to that session, identical to `/switch`.
+fn cmd_resume(sessions: &SessionManager, key: &str, agent_name: &str, args: &str) -> String {
+    if args.is_empty() {
+        let list = sessions.list_for_agent(key, agent_name);
+        if list.is_empty() {
+            return "No sessions to resume. Use /new to start one.".to_string();
+        }
+        return format!(
+            "{}\n\nResume one with /resume <number or id>.",
+            cmd_list(sessions, key, agent_name)
+        );
+    }
+    cmd_switch(sessions, key, args)
 }
 
 fn cmd_current(sessions: &SessionManager, key: &str) -> String {
@@ -501,6 +522,52 @@ fn cmd_dir(
     format!("📁 已切换到: {}", canonical.display())
 }
 
+/// `/attach [tmux-session-name]` — bind THIS channel to a specific tmux session
+/// (tmux backend). With no argument, lists the running tmux sessions so the user
+/// can pick one. Different channels can `/attach` different sessions, letting one
+/// bot drive several hand-started `cc` sessions concurrently.
+async fn cmd_attach(sessions: &SessionManager, key: &str, args: &str) -> String {
+    let target = args.trim();
+    if target.is_empty() {
+        let current = sessions
+            .get_tmux_session(key)
+            .map(|s| format!("\n当前已绑定: {}", s))
+            .unwrap_or_default();
+        return match list_tmux_sessions().await {
+            Some(list) if !list.is_empty() => format!(
+                "可 attach 的 tmux 会话:\n{}\n\n用 /attach <会话名> 绑定本频道。{}",
+                list.join("\n"),
+                current
+            ),
+            Some(_) => format!("没有运行中的 tmux 会话。{}", current),
+            None => format!("无法列出 tmux 会话(tmux 未运行?)。{}", current),
+        };
+    }
+    sessions.set_tmux_session(key, target);
+    // Drop the current session id so the next message attaches fresh.
+    sessions.set_agent_session_id(key, "");
+    format!("🔗 本频道已绑定 tmux 会话: {}", target)
+}
+
+/// List running tmux session names via `tmux ls`. Returns None if tmux is
+/// unavailable or no server is running.
+async fn list_tmux_sessions() -> Option<Vec<String>> {
+    let output = tokio::process::Command::new("tmux")
+        .args(["list-sessions", "-F", "#{session_name}"])
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return Some(Vec::new());
+    }
+    let names: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    Some(names)
+}
+
 fn cmd_sync(config: &ProjectConfig, args: &str) -> String {
     let sync_config = match &config.sync {
         Some(c) => c,
@@ -521,6 +588,64 @@ fn cmd_sync(config: &ProjectConfig, args: &str) -> String {
     match crate::sync::run_sync(sync_config, direction) {
         Ok(result) => result.to_string(),
         Err(e) => format!("Sync failed: {}", e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn test_manager() -> (TempDir, SessionManager) {
+        let tmp = TempDir::new().unwrap();
+        let mgr = SessionManager::new(tmp.path(), tmp.path());
+        (tmp, mgr)
+    }
+
+    #[tokio::test]
+    async fn attach_binds_channel_to_named_session() {
+        let (_tmp, mgr) = test_manager();
+        let key = "discord:chanA";
+        let reply = cmd_attach(&mgr, key, "nova-bidding").await;
+        assert!(reply.contains("nova-bidding"), "got: {reply}");
+        assert_eq!(mgr.get_tmux_session(key).as_deref(), Some("nova-bidding"));
+    }
+
+    #[tokio::test]
+    async fn attach_different_channels_bind_different_sessions() {
+        let (_tmp, mgr) = test_manager();
+        cmd_attach(&mgr, "discord:A", "proj-a").await;
+        cmd_attach(&mgr, "discord:B", "proj-b").await;
+        assert_eq!(mgr.get_tmux_session("discord:A").as_deref(), Some("proj-a"));
+        assert_eq!(mgr.get_tmux_session("discord:B").as_deref(), Some("proj-b"));
+    }
+
+    #[test]
+    fn resume_no_args_no_sessions_prompts_new() {
+        let (_tmp, mgr) = test_manager();
+        let reply = cmd_resume(&mgr, "discord:chan", "claude", "");
+        assert!(reply.contains("No sessions"), "got: {reply}");
+        assert!(reply.contains("/new"));
+    }
+
+    #[test]
+    fn resume_no_args_lists_sessions_with_hint() {
+        let (_tmp, mgr) = test_manager();
+        mgr.new_session_with_agent("discord:chan", Some("first".into()), "claude");
+        let reply = cmd_resume(&mgr, "discord:chan", "claude", "");
+        assert!(reply.contains("first"), "got: {reply}");
+        assert!(reply.contains("/resume <number or id>"), "got: {reply}");
+    }
+
+    #[test]
+    fn resume_with_id_prefix_switches_session() {
+        let (_tmp, mgr) = test_manager();
+        let s1 = mgr.new_session_with_agent("discord:chan", Some("one".into()), "claude");
+        // Make "two" the active session, then resume back to s1 by ID prefix.
+        mgr.new_session_with_agent("discord:chan", Some("two".into()), "claude");
+        let reply = cmd_resume(&mgr, "discord:chan", "claude", &s1.id[..8]);
+        assert!(reply.contains("Switched to"), "got: {reply}");
+        assert_eq!(mgr.get_or_create("discord:chan").id, s1.id);
     }
 }
 

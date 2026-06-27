@@ -15,10 +15,11 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, Notify};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
-use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{client_async_tls, connect_async, MaybeTlsStream, WebSocketStream};
 
 use crate::core::message::IncomingMessage;
 use crate::core::platform::{
@@ -237,6 +238,142 @@ async fn get_gateway_url(client: &reqwest::Client, token: &str) -> Result<String
     Ok(format!("{}/?v=10&encoding=json", ws_url))
 }
 
+/// Resolve an outbound HTTP proxy for the Gateway connection from the
+/// environment, mirroring the convention reqwest uses for REST calls so the
+/// WebSocket path behaves the same in proxied networks.
+///
+/// Discord's Gateway is wss:// (HTTPS), so `https_proxy` takes precedence,
+/// then `all_proxy`. `no_proxy` is intentionally not honored: the Gateway host
+/// is fixed and a user setting a proxy almost always needs it to reach Discord.
+fn gateway_proxy_from_env() -> Option<String> {
+    for key in ["https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"] {
+        if let Ok(val) = std::env::var(key) {
+            let val = val.trim();
+            if !val.is_empty() {
+                return Some(val.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Split a proxy URL like `http://127.0.0.1:7890` into `(host, port)`.
+/// Only plain HTTP CONNECT proxies are supported (the common Clash/V2Ray case).
+fn parse_proxy_authority(proxy: &str) -> Result<(String, u16)> {
+    let without_scheme = proxy
+        .strip_prefix("http://")
+        .or_else(|| proxy.strip_prefix("https://"))
+        .unwrap_or(proxy);
+    // Drop any path/userinfo; we only need host:port.
+    let authority = without_scheme
+        .split('/')
+        .next()
+        .unwrap_or(without_scheme);
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+    let (host, port) = authority
+        .rsplit_once(':')
+        .ok_or_else(|| anyhow::anyhow!("proxy URL missing port: {}", proxy))?;
+    let port: u16 = port
+        .parse()
+        .with_context(|| format!("invalid proxy port in {}", proxy))?;
+    Ok((host.to_string(), port))
+}
+
+/// Establish a TCP stream to `target_host:target_port` through an HTTP CONNECT
+/// proxy, returning the tunneled stream ready for a TLS+WebSocket handshake.
+async fn connect_via_http_proxy(
+    proxy: &str,
+    target_host: &str,
+    target_port: u16,
+) -> Result<TcpStream> {
+    let (phost, pport) = parse_proxy_authority(proxy)?;
+    let mut stream = TcpStream::connect((phost.as_str(), pport))
+        .await
+        .with_context(|| format!("connect to proxy {}:{}", phost, pport))?;
+
+    let connect_req = format!(
+        "CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n",
+        host = target_host,
+        port = target_port
+    );
+    stream
+        .write_all(connect_req.as_bytes())
+        .await
+        .context("write CONNECT to proxy")?;
+    stream.flush().await.ok();
+
+    // Read the proxy response headers (until the blank line). The response is
+    // small; a bounded read avoids consuming any tunneled bytes that follow.
+    let mut buf = Vec::with_capacity(256);
+    let mut byte = [0u8; 1];
+    loop {
+        let n = stream.read(&mut byte).await.context("read proxy response")?;
+        if n == 0 {
+            return Err(anyhow::anyhow!("proxy closed connection during CONNECT"));
+        }
+        buf.push(byte[0]);
+        if buf.ends_with(b"\r\n\r\n") {
+            break;
+        }
+        if buf.len() > 8192 {
+            return Err(anyhow::anyhow!("proxy CONNECT response too large"));
+        }
+    }
+
+    let head = String::from_utf8_lossy(&buf);
+    let status_line = head.lines().next().unwrap_or("");
+    // Expect e.g. "HTTP/1.1 200 Connection established".
+    let ok = status_line
+        .split_whitespace()
+        .nth(1)
+        .map(|code| code == "200")
+        .unwrap_or(false);
+    if !ok {
+        return Err(anyhow::anyhow!(
+            "proxy CONNECT failed: {}",
+            status_line.trim()
+        ));
+    }
+    Ok(stream)
+}
+
+/// Connect to the Discord Gateway, tunneling through an HTTP proxy when one is
+/// configured in the environment. Falls back to a direct connection otherwise.
+///
+/// Returns the same stream type as `connect_async` so callers are unchanged.
+async fn connect_gateway(
+    gateway_url: &str,
+) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
+    let Some(proxy) = gateway_proxy_from_env() else {
+        let (ws, _) = connect_async(gateway_url).await?;
+        return Ok(ws);
+    };
+
+    // Derive target host:port from the wss:// URL (Gateway is always TLS:443).
+    let after_scheme = gateway_url
+        .strip_prefix("wss://")
+        .or_else(|| gateway_url.strip_prefix("https://"))
+        .unwrap_or(gateway_url);
+    let host = after_scheme
+        .split(['/', '?'])
+        .next()
+        .unwrap_or(after_scheme)
+        .rsplit('@')
+        .next()
+        .unwrap_or(after_scheme);
+    let (host, port) = match host.rsplit_once(':') {
+        Some((h, p)) => (h.to_string(), p.parse().unwrap_or(443)),
+        None => (host.to_string(), 443u16),
+    };
+
+    tracing::info!(proxy = %proxy, host = %host, port, "discord: connecting via HTTP proxy");
+    let tunnel = connect_via_http_proxy(&proxy, &host, port).await?;
+    let (ws, _) = client_async_tls(gateway_url, tunnel)
+        .await
+        .context("websocket handshake over proxy tunnel")?;
+    Ok(ws)
+}
+
 // ---------------------------------------------------------------------------
 // Platform trait
 // ---------------------------------------------------------------------------
@@ -299,8 +436,8 @@ impl Platform for DiscordPlatform {
 
                 tracing::info!(is_resume, "discord: connecting to gateway {}", gateway_url);
 
-                let ws_result = connect_async(&gateway_url).await;
-                let (ws_stream, _) = match ws_result {
+                let ws_result = connect_gateway(&gateway_url).await;
+                let ws_stream = match ws_result {
                     Ok(s) => s,
                     Err(e) => {
                         tracing::error!(error = %e, backoff = backoff_secs, "discord: gateway connect failed, retrying");
@@ -1589,6 +1726,37 @@ mod tests {
     #[test]
     fn strip_user_mention() {
         assert_eq!(strip_mentions("<@123456> hello"), " hello");
+    }
+
+    #[test]
+    fn parse_proxy_authority_basic() {
+        let (h, p) = parse_proxy_authority("http://127.0.0.1:7890").unwrap();
+        assert_eq!(h, "127.0.0.1");
+        assert_eq!(p, 7890);
+    }
+
+    #[test]
+    fn parse_proxy_authority_no_scheme() {
+        let (h, p) = parse_proxy_authority("localhost:1080").unwrap();
+        assert_eq!(h, "localhost");
+        assert_eq!(p, 1080);
+    }
+
+    #[test]
+    fn parse_proxy_authority_with_userinfo_and_path() {
+        let (h, p) = parse_proxy_authority("http://user:pass@proxy.local:8080/").unwrap();
+        assert_eq!(h, "proxy.local");
+        assert_eq!(p, 8080);
+    }
+
+    #[test]
+    fn parse_proxy_authority_missing_port_errors() {
+        assert!(parse_proxy_authority("http://127.0.0.1").is_err());
+    }
+
+    #[test]
+    fn parse_proxy_authority_bad_port_errors() {
+        assert!(parse_proxy_authority("http://127.0.0.1:notaport").is_err());
     }
 
     #[test]

@@ -21,6 +21,9 @@ pub struct AppConfig {
     /// Webhook server config.
     pub webhook: Option<WebhookConfig>,
 
+    /// Hook receiver server config (Claude Code Stop/PostToolUse hook relay).
+    pub hook_receiver: Option<HookReceiverConfig>,
+
     /// Log config.
     pub log: Option<LogConfig>,
 }
@@ -50,6 +53,30 @@ pub struct WebhookConfig {
 
 fn default_webhook_port() -> u16 {
     9111
+}
+
+/// Hook receiver HTTP endpoint config. Listens on localhost for Claude Code
+/// Stop/PostToolUse hook payloads and relays them into the matching session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HookReceiverConfig {
+    /// Port the localhost receiver binds to. The installer bakes this same
+    /// value into the hook command, so the two must agree (ADR-8).
+    #[serde(default = "default_hook_receiver_port")]
+    pub port: u16,
+}
+
+impl Default for HookReceiverConfig {
+    fn default() -> Self {
+        Self {
+            port: default_hook_receiver_port(),
+        }
+    }
+}
+
+/// Default hook receiver port. Distinct from the webhook port (9111) and the
+/// gateway port (9900) so the three localhost servers never collide (ADR-8).
+pub fn default_hook_receiver_port() -> u16 {
+    9123
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -311,6 +338,13 @@ pub struct TmuxConfig {
     /// Automatically restart claude if it exits.
     #[serde(default = "default_true")]
     pub auto_restart: bool,
+    /// Hook relay mode: the turn's reply text comes from Claude Code's Stop
+    /// hook (relayed via the hook receiver) instead of being scraped from the
+    /// pane. In this mode the poll loop stops emitting Text/Result and the
+    /// visible heartbeat, keeping only permission detection — the hook's Stop
+    /// is the single source of the turn-ending Result.
+    #[serde(default)]
+    pub hook_relay: bool,
 }
 
 fn default_backend_claude() -> String {
@@ -566,6 +600,7 @@ projects:
             data_dir: PathBuf::from("/tmp"),
             projects: vec![],
             webhook: None,
+            hook_receiver: None,
             log: None,
         };
         assert!(validate(&config).is_err());

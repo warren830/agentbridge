@@ -58,6 +58,11 @@ pub async fn process_agent_events(
     display: &DisplayConfig,
     event_broadcast: &Arc<tokio::sync::broadcast::Sender<(String, crate::core::event::AgentEvent)>>,
     session_key_for_broadcast: &str,
+    // When true (the tmux+hook backend), tool-use events are coalesced into a
+    // single in-place-edited progress message instead of one chat message per
+    // tool — so a long, tool-heavy turn shows live progress without spamming.
+    // claude/acp leave this false and keep their existing per-tool reply.
+    tool_progress_inplace: bool,
 ) -> Result<EventLoopResult> {
     let mut preview = StreamPreview::new();
     let mut handle: Option<Box<dyn PreviewHandle>> = None;
@@ -65,6 +70,10 @@ pub async fn process_agent_events(
     // before agent spawn, so the user sees feedback during spawn time.
     let mut stop_typing = stop_typing_in;
     let mut tool_count: usize = 0;
+    // In-place tool-progress state (tool_progress_inplace mode only): the live
+    // progress message handle and the running list of tools this turn.
+    let mut progress_handle: Option<Box<dyn PreviewHandle>> = None;
+    let mut progress_tools: Vec<String> = Vec::new();
 
     let mut result_info = EventLoopResult {
         final_text: String::new(),
@@ -73,22 +82,44 @@ pub async fn process_agent_events(
         output_tokens: 0,
     };
 
+    // The overall idle deadline; recomputed each time an event resets it. We
+    // poll for events on a short tick so a /stop (which sets stopped_flag) is
+    // honoured PROMPTLY even when the agent sends no further events — otherwise
+    // the loop would block on recv() and keep the typing indicator running
+    // until the next event (which, on an interrupted tmux turn, never comes).
+    const STOP_POLL: Duration = Duration::from_millis(250);
+    let mut idle_deadline = tokio::time::Instant::now() + EVENT_IDLE_TIMEOUT;
+
     loop {
-        // Use idle timeout to detect stalled agent sessions
-        let event = match tokio::time::timeout(EVENT_IDLE_TIMEOUT, rx.recv()).await {
-            Ok(Some(event)) => event,
+        // Honour a pending /stop before blocking again.
+        if stopped_flag.load(Ordering::Acquire) {
+            tracing::info!("event loop stopped by /stop command");
+            discard_preview(platform, &mut handle).await;
+            break;
+        }
+
+        let event = match tokio::time::timeout(STOP_POLL, rx.recv()).await {
+            Ok(Some(event)) => {
+                idle_deadline = tokio::time::Instant::now() + EVENT_IDLE_TIMEOUT;
+                event
+            }
             Ok(None) => {
                 tracing::warn!("agent event channel closed unexpectedly");
                 discard_preview(platform, &mut handle).await;
                 break;
             }
             Err(_) => {
-                tracing::error!("agent session idle timeout ({:?})", EVENT_IDLE_TIMEOUT);
-                discard_preview(platform, &mut handle).await;
-                let _ = platform
-                    .reply(ctx, "💤 等太久了，Agent 没响应")
-                    .await;
-                break;
+                // No event this tick. Loop back to re-check the stop flag; only
+                // give up once the full idle timeout has elapsed with no events.
+                if tokio::time::Instant::now() >= idle_deadline {
+                    tracing::error!("agent session idle timeout ({:?})", EVENT_IDLE_TIMEOUT);
+                    discard_preview(platform, &mut handle).await;
+                    let _ = platform
+                        .reply(ctx, "💤 等太久了，Agent 没响应")
+                        .await;
+                    break;
+                }
+                continue;
             }
         };
 
@@ -170,7 +201,30 @@ pub async fn process_agent_events(
             // ----- Tool use notification -----
             AgentEvent::ToolUse { tool, input, .. } => {
                 tool_count += 1;
-                if display.tool_messages {
+                if !display.tool_messages {
+                    // tool messages disabled — nothing to show either way.
+                } else if tool_progress_inplace {
+                    // Coalesce into one in-place-edited progress message: append
+                    // this tool to the running list and edit the single message,
+                    // so an N-tool turn produces ~1 message, not N (FR-5.2).
+                    progress_tools.push(format_tool_label(&tool, &input, display.tool_max_len));
+                    let body = render_progress(&progress_tools, false);
+                    if let Some(updater) = platform.as_message_updater() {
+                        match progress_handle.as_ref() {
+                            None => match updater.send_preview(ctx, &body).await {
+                                Ok(h) => progress_handle = Some(h),
+                                Err(e) => tracing::warn!(error = %e, "progress send_preview failed"),
+                            },
+                            Some(h) => {
+                                if let Err(e) = updater.update_preview(h.as_ref(), &body).await {
+                                    tracing::warn!(error = %e, "progress update_preview failed");
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // Existing per-tool reply (claude/acp backends): one chat
+                    // message per tool, unchanged.
                     freeze_and_detach_preview(platform, &mut preview, &mut handle).await;
                     let max = display.tool_max_len;
                     let formatted_input = match tool.as_str() {
@@ -328,7 +382,14 @@ pub async fn process_agent_events(
                 input_tokens,
                 output_tokens,
             } => {
-                if input_tokens == 0
+                // The empty-resume guard skips a spurious empty Result so it
+                // doesn't end a turn prematurely (a claude-backend resume quirk).
+                // It must NOT apply in hook mode: there an empty Result is the
+                // intentional turn-end safety net (an interrupted turn fires no
+                // Stop hook), and swallowing it would leave the session stuck
+                // busy forever — the very hang the safety net exists to prevent.
+                if !tool_progress_inplace
+                    && input_tokens == 0
                     && output_tokens == 0
                     && content.is_empty()
                     && !preview.was_active()
@@ -340,6 +401,21 @@ pub async fn process_agent_events(
                 if let Some(stop_fn) = stop_typing.take() {
                     stop_fn();
                 }
+
+                // End-of-turn: settle the in-place progress message into its
+                // final "done" form (all steps ✓), so it reads as a completed
+                // trace beneath the final answer rather than a frozen "处理中…".
+                if let Some(h) = progress_handle.take() {
+                    if !progress_tools.is_empty() {
+                        if let Some(updater) = platform.as_message_updater() {
+                            let body = render_progress(&progress_tools, true);
+                            if let Err(e) = updater.update_preview(h.as_ref(), &body).await {
+                                tracing::warn!(error = %e, "progress finalize update failed");
+                            }
+                        }
+                    }
+                }
+                progress_tools.clear();
 
                 preview.finish();
 
@@ -412,6 +488,59 @@ pub async fn process_agent_events(
 }
 
 // ---------------------------------------------------------------------------
+// Tool-progress helpers (in-place mode)
+// ---------------------------------------------------------------------------
+
+/// A compact label for one tool call in the progress list, e.g. `Bash: ls -la`.
+/// Truncation is char-boundary-safe (never byte-slices multibyte/CJK text).
+fn format_tool_label(tool: &str, input: &str, max: usize) -> String {
+    let input = input.trim();
+    if input.is_empty() {
+        return tool.to_string();
+    }
+    let shown: String = if input.chars().count() > max {
+        format!("{}…", input.chars().take(max).collect::<String>())
+    } else {
+        input.to_string()
+    };
+    // Collapse newlines so a multiline command stays a single progress line.
+    let shown = shown.replace('\n', " ");
+    format!("{}: {}", tool, shown)
+}
+
+/// Render the running tool list into one progress message. While the turn is
+/// live (`done == false`) the last tool is marked "current" (`▸`); when the
+/// turn ends (`done == true`) every tool is marked done (`✓`) and the header
+/// flips to a completion line, so the single edited message reads as live
+/// progress and then settles into a "what I did" trace.
+fn render_progress(tools: &[String], done: bool) -> String {
+    if tools.is_empty() {
+        return if done { "✓ 完成".to_string() } else { "⚡ 处理中…".to_string() };
+    }
+    let n = tools.len();
+    let mut lines = Vec::with_capacity(n + 1);
+    lines.push(if done {
+        format!("✓ 完成 ({} 步)", n)
+    } else {
+        format!("⚡ 处理中… ({} 步)", n)
+    });
+    // Cap the visible list so a very long turn doesn't grow an unbounded
+    // message; keep the most recent few (the tail is what's "current").
+    const MAX_SHOWN: usize = 8;
+    let start = n.saturating_sub(MAX_SHOWN);
+    if start > 0 {
+        lines.push(format!("…(前 {} 步省略)", start));
+    }
+    for (i, t) in tools[start..].iter().enumerate() {
+        let idx = start + i + 1;
+        // The tail item is "current" only mid-turn; once done, all are ✓.
+        let marker = if !done && start + i + 1 == n { "▸" } else { "✓" };
+        lines.push(format!("{} {}. {}", marker, idx, t));
+    }
+    lines.join("\n")
+}
+
+// ---------------------------------------------------------------------------
 // Preview helpers
 // ---------------------------------------------------------------------------
 
@@ -452,5 +581,347 @@ fn summarise_json(value: &serde_json::Value, max_len: usize) -> String {
         format!("{}...", s.chars().take(max_len).collect::<String>())
     } else {
         s
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{format_tool_label, render_progress};
+
+    #[test]
+    fn format_tool_label_truncates_on_char_boundary() {
+        // A multibyte/CJK input must never be byte-sliced (would panic). Use a
+        // small max so truncation triggers, then assert the result is valid and
+        // ends with the ellipsis marker.
+        let label = format_tool_label("Bash", "你好世界你好世界", 3);
+        assert_eq!(label, "Bash: 你好世…");
+    }
+
+    #[test]
+    fn format_tool_label_no_input_is_tool_name() {
+        assert_eq!(format_tool_label("Read", "", 40), "Read");
+        assert_eq!(format_tool_label("Read", "   ", 40), "Read");
+    }
+
+    #[test]
+    fn format_tool_label_collapses_newlines() {
+        // A multiline command stays one progress line.
+        let label = format_tool_label("Bash", "echo a\necho b", 40);
+        assert_eq!(label, "Bash: echo a echo b");
+    }
+
+    #[test]
+    fn render_progress_marks_current_then_done() {
+        let tools = vec!["Bash: ls".to_string(), "Edit: a.rs".to_string()];
+        let live = render_progress(&tools, false);
+        assert!(live.starts_with("⚡ 处理中… (2 步)"));
+        assert!(live.contains("✓ 1. Bash: ls"), "earlier step is done: {live}");
+        assert!(live.contains("▸ 2. Edit: a.rs"), "tail step is current: {live}");
+
+        let done = render_progress(&tools, true);
+        assert!(done.starts_with("✓ 完成 (2 步)"));
+        assert!(done.contains("✓ 2. Edit: a.rs"), "all steps done when finished: {done}");
+        assert!(!done.contains('▸'), "no current marker once done: {done}");
+    }
+
+    #[test]
+    fn render_progress_caps_long_list() {
+        let tools: Vec<String> = (0..20).map(|i| format!("Tool{i}")).collect();
+        let out = render_progress(&tools, false);
+        assert!(out.contains("…(前 12 步省略)"), "elides all but the last 8: {out}");
+        // The most recent step is shown and marked current.
+        assert!(out.contains("▸ 20. Tool19"), "{out}");
+        // An early step is not shown.
+        assert!(!out.contains("Tool0\n") && !out.contains(" 1. Tool0"), "{out}");
+    }
+
+    #[test]
+    fn render_progress_empty() {
+        assert_eq!(render_progress(&[], false), "⚡ 处理中…");
+        assert_eq!(render_progress(&[], true), "✓ 完成");
+    }
+
+    // -- Event-loop integration: in-place progress contract --------------------
+    //
+    // Drives the real `process_agent_events` with a synthetic event stream and a
+    // minimal in-crate mock platform, asserting the Bolt-2 contract end to end:
+    // a tool-heavy turn yields ONE evolving progress message (not one chat
+    // message per tool), finalized on Result. The MockPlatform in tests/common
+    // can't be used here (integration tests can't reach this binary-only
+    // module), so a small local mock is defined.
+
+    use super::{process_agent_events, AgentEvent, DisplayConfig};
+    use crate::agent::PermissionResponder;
+    use crate::core::platform::{
+        MessageUpdater, Platform, PlatformCapabilities, PreviewHandle, ReplyCtx,
+    };
+    use crate::engine::PermissionDecision;
+    use anyhow::Result as AnyResult;
+    use async_trait::async_trait;
+    use std::any::Any;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::{broadcast, mpsc};
+
+    #[derive(Debug, Clone)]
+    enum Rec {
+        Reply(String),
+        PreviewCreate(String),
+        PreviewUpdate(String),
+        PreviewDelete,
+    }
+
+    #[derive(Debug)]
+    struct TestCtx;
+    impl ReplyCtx for TestCtx {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn session_key_hint(&self) -> String {
+            "test:ctx".to_string()
+        }
+        fn clone_box(&self) -> Box<dyn ReplyCtx> {
+            Box::new(TestCtx)
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestHandle;
+    impl PreviewHandle for TestHandle {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    struct TestPlatform {
+        rec: Arc<Mutex<Vec<Rec>>>,
+        previews_created: Arc<AtomicU64>,
+    }
+
+    impl TestPlatform {
+        fn new() -> Self {
+            Self {
+                rec: Arc::new(Mutex::new(Vec::new())),
+                previews_created: Arc::new(AtomicU64::new(0)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Platform for TestPlatform {
+        fn name(&self) -> &str {
+            "test"
+        }
+        async fn start(&self, _handler: crate::core::platform::MessageHandler) -> AnyResult<()> {
+            Ok(())
+        }
+        async fn reply(&self, _ctx: &dyn ReplyCtx, content: &str) -> AnyResult<()> {
+            self.rec.lock().unwrap().push(Rec::Reply(content.to_string()));
+            Ok(())
+        }
+        async fn send(&self, ctx: &dyn ReplyCtx, content: &str) -> AnyResult<()> {
+            self.reply(ctx, content).await
+        }
+        async fn stop(&self) -> AnyResult<()> {
+            Ok(())
+        }
+    }
+
+    impl PlatformCapabilities for TestPlatform {
+        fn as_message_updater(&self) -> Option<&dyn MessageUpdater> {
+            Some(self)
+        }
+    }
+
+    #[async_trait]
+    impl MessageUpdater for TestPlatform {
+        async fn send_preview(
+            &self,
+            _ctx: &dyn ReplyCtx,
+            text: &str,
+        ) -> AnyResult<Box<dyn PreviewHandle>> {
+            self.previews_created.fetch_add(1, Ordering::SeqCst);
+            self.rec.lock().unwrap().push(Rec::PreviewCreate(text.to_string()));
+            Ok(Box::new(TestHandle))
+        }
+        async fn update_preview(&self, _handle: &dyn PreviewHandle, text: &str) -> AnyResult<()> {
+            self.rec.lock().unwrap().push(Rec::PreviewUpdate(text.to_string()));
+            Ok(())
+        }
+        async fn delete_preview(&self, _handle: &dyn PreviewHandle) -> AnyResult<()> {
+            self.rec.lock().unwrap().push(Rec::PreviewDelete);
+            Ok(())
+        }
+    }
+
+    struct NoopResponder;
+    #[async_trait]
+    impl PermissionResponder for NoopResponder {
+        async fn respond(&self, _request_id: &str, _allow: bool) -> AnyResult<()> {
+            Ok(())
+        }
+    }
+
+    fn tool_ev(name: &str, input: &str) -> AgentEvent {
+        AgentEvent::ToolUse {
+            id: String::new(),
+            tool: name.to_string(),
+            input: input.to_string(),
+        }
+    }
+
+    fn result_ev(content: &str) -> AgentEvent {
+        AgentEvent::Result {
+            content: content.to_string(),
+            session_id: "s1".to_string(),
+            input_tokens: 0,
+            output_tokens: 0,
+        }
+    }
+
+    async fn drive(events: Vec<AgentEvent>, inplace: bool) -> Vec<Rec> {
+        let tp = Arc::new(TestPlatform::new());
+        let rec = Arc::clone(&tp.rec);
+        let platform: Arc<dyn PlatformCapabilities> = tp;
+        let ctx = TestCtx;
+
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(32);
+        for ev in events {
+            tx.send(ev).await.unwrap();
+        }
+        drop(tx);
+
+        let (_perm_tx, mut perm_rx) = mpsc::channel::<PermissionDecision>(1);
+        let responder: Arc<dyn PermissionResponder> = Arc::new(NoopResponder);
+        let mut approve_all = false;
+        let pending = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let display = DisplayConfig::default();
+        let (btx, _brx) = broadcast::channel(32);
+        let btx = Arc::new(btx);
+
+        process_agent_events(
+            &platform, &ctx, &mut rx, &mut perm_rx, &responder, &mut approve_all,
+            &pending, &stopped, None, &display, &btx, "test:session", inplace,
+        )
+        .await
+        .expect("event loop ok");
+
+        let out = rec.lock().unwrap().clone();
+        out
+    }
+
+    #[tokio::test]
+    async fn stop_flag_breaks_loop_promptly_and_stops_typing() {
+        // Regression: /stop set the stopped flag while the loop was blocked on
+        // recv() with no further events (an interrupted tmux turn). The loop
+        // must wake within the poll interval, break, and run the post-loop
+        // typing-stop — not hang until the 300s idle timeout with the phone
+        // stuck "typing…".
+        let tp = Arc::new(TestPlatform::new());
+        let platform: Arc<dyn PlatformCapabilities> = tp;
+        let ctx = TestCtx;
+
+        // Channel stays OPEN with NO events queued — mimics an interrupted turn.
+        let (_tx_keepalive, mut rx) = mpsc::channel::<AgentEvent>(8);
+        let (_perm_tx, mut perm_rx) = mpsc::channel::<PermissionDecision>(1);
+        let responder: Arc<dyn PermissionResponder> = Arc::new(NoopResponder);
+        let mut approve_all = false;
+        let pending = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::new(AtomicBool::new(true)); // /stop already fired
+        let display = DisplayConfig::default();
+        let (btx, _brx) = broadcast::channel(8);
+        let btx = Arc::new(btx);
+
+        // Typing indicator with a flag the stop-closure flips, so we can assert
+        // the loop actually stopped typing on its way out.
+        let typing = Arc::new(AtomicBool::new(true));
+        let typing_for_closure = Arc::clone(&typing);
+        let stop_typing: Box<dyn FnOnce() + Send> =
+            Box::new(move || typing_for_closure.store(false, Ordering::SeqCst));
+
+        let start = tokio::time::Instant::now();
+        process_agent_events(
+            &platform, &ctx, &mut rx, &mut perm_rx, &responder, &mut approve_all,
+            &pending, &stopped, Some(stop_typing), &display, &btx, "test:session", true,
+        )
+        .await
+        .expect("event loop ok");
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "loop must break promptly on /stop, took {elapsed:?}"
+        );
+        assert!(
+            !typing.load(Ordering::SeqCst),
+            "typing indicator must be stopped when the loop exits on /stop"
+        );
+    }
+
+    #[tokio::test]
+    async fn inplace_mode_coalesces_tools_into_one_progress_message() {
+        let rec = drive(
+            vec![
+                tool_ev("Bash", "ls -la"),
+                tool_ev("Edit", "/x/a.rs"),
+                tool_ev("Read", "/x/b.rs"),
+                result_ev("最终答案"),
+            ],
+            true,
+        )
+        .await;
+
+        // Exactly one preview created — not one per tool.
+        let creates = rec.iter().filter(|r| matches!(r, Rec::PreviewCreate(_))).count();
+        assert_eq!(creates, 1, "exactly one progress preview: {rec:?}");
+
+        // Never deleted — the trace stays in the chat.
+        assert!(
+            !rec.iter().any(|r| matches!(r, Rec::PreviewDelete)),
+            "progress must not be deleted: {rec:?}"
+        );
+
+        // The last preview write is the finalize (done form, all three tools).
+        let last_preview = rec
+            .iter()
+            .rev()
+            .find_map(|r| match r {
+                Rec::PreviewUpdate(t) | Rec::PreviewCreate(t) => Some(t.clone()),
+                _ => None,
+            })
+            .expect("a preview write");
+        assert!(last_preview.starts_with("✓ 完成 (3 步)"), "final: {last_preview}");
+        assert!(last_preview.contains("Bash: ls -la"), "final: {last_preview}");
+        assert!(!last_preview.contains('▸'), "no current marker: {last_preview}");
+
+        // Final answer replied; no per-tool "⚡" spam.
+        assert!(
+            rec.iter().any(|r| matches!(r, Rec::Reply(c) if c.contains("最终答案"))),
+            "final answer replied: {rec:?}"
+        );
+        assert!(
+            !rec.iter().any(|r| matches!(r, Rec::Reply(c) if c.starts_with("⚡ "))),
+            "no per-tool chat spam: {rec:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_inplace_mode_keeps_per_tool_messages() {
+        let rec = drive(
+            vec![tool_ev("Bash", "ls"), tool_ev("Edit", "/x/a.rs"), result_ev("done")],
+            false,
+        )
+        .await;
+
+        let tool_msgs = rec
+            .iter()
+            .filter(|r| matches!(r, Rec::Reply(c) if c.starts_with("⚡ ")))
+            .count();
+        assert_eq!(tool_msgs, 2, "one chat message per tool: {rec:?}");
+        assert!(
+            !rec.iter().any(|r| matches!(r, Rec::PreviewCreate(t) if t.contains("处理中"))),
+            "no progress preview in non-inplace mode: {rec:?}"
+        );
     }
 }

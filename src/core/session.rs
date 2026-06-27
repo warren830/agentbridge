@@ -31,6 +31,11 @@ pub struct Session {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub work_dir: Option<String>,
+    /// tmux backend: an explicit session name this channel attaches to
+    /// (set via `/attach`). Lets different channels drive different tmux
+    /// sessions. None → fall back to config/derived name.
+    #[serde(default)]
+    pub tmux_session: Option<String>,
     #[serde(skip)]
     busy: AtomicBool,
 }
@@ -51,6 +56,7 @@ impl Session {
             created_at: now,
             updated_at: now,
             work_dir: None,
+            tmux_session: None,
             busy: AtomicBool::new(false),
         }
     }
@@ -213,6 +219,8 @@ struct SessionData {
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
     work_dir: Option<String>,
+    #[serde(default)]
+    tmux_session: Option<String>,
 }
 
 impl SessionData {
@@ -225,6 +233,7 @@ impl SessionData {
             created_at: self.created_at,
             updated_at: self.updated_at,
             work_dir: self.work_dir,
+            tmux_session: self.tmux_session,
             busy: AtomicBool::new(false),
         }
     }
@@ -239,6 +248,7 @@ impl SessionData {
             created_at: session.created_at,
             updated_at: session.updated_at,
             work_dir: session.work_dir.clone(),
+            tmux_session: session.tmux_session.clone(),
         }
     }
 }
@@ -449,6 +459,12 @@ impl SessionManager {
 
     /// Set the work directory override for the active session of a key.
     pub fn set_work_dir(&self, key: &str, work_dir: &str) {
+        // Ensure a session exists for this key first. Without this, `/dir` as
+        // the very FIRST message in a channel was a silent no-op: there was no
+        // active session yet, so the directory was dropped and the next message
+        // spawned the agent in the default work_dir instead.
+        let _ = self.get_or_create(key);
+
         let active = self.active_keys.lock().unwrap();
         if let Some(session_id) = active.get(key).cloned() {
             drop(active);
@@ -479,6 +495,7 @@ impl SessionManager {
                         created_at: old.created_at,
                         updated_at: Utc::now(),
                         work_dir: Some(work_dir.to_string()),
+                        tmux_session: old.tmux_session.clone(),
                         busy: AtomicBool::new(false),
                     });
                     all.insert(session_id.clone(), new_session);
@@ -502,6 +519,42 @@ impl SessionManager {
         sessions.get(session_id)?.work_dir.clone()
     }
 
+    /// Get the explicit tmux session name bound to a key (via `/attach`).
+    pub fn get_tmux_session(&self, key: &str) -> Option<String> {
+        let active = self.active_keys.lock().unwrap();
+        let session_id = active.get(key)?;
+        let sessions = self.sessions.lock().unwrap();
+        sessions.get(session_id)?.tmux_session.clone()
+    }
+
+    /// Bind a key to an explicit tmux session name (via `/attach`). Ensures a
+    /// session exists first (mirrors set_work_dir, so `/attach` works as a
+    /// channel's very first command). Rebuilds the session in place.
+    pub fn set_tmux_session(&self, key: &str, tmux_session: &str) {
+        let _ = self.get_or_create(key);
+        let active = self.active_keys.lock().unwrap();
+        if let Some(session_id) = active.get(key).cloned() {
+            drop(active);
+            let mut all = self.sessions.lock().unwrap();
+            if let Some(old) = all.remove(&session_id) {
+                let new_session = Arc::new(Session {
+                    id: old.id.clone(),
+                    name: old.name.clone(),
+                    agent_session_id: old.agent_session_id.clone(),
+                    agent_type: old.agent_type.clone(),
+                    created_at: old.created_at,
+                    updated_at: Utc::now(),
+                    work_dir: old.work_dir.clone(),
+                    tmux_session: Some(tmux_session.to_string()),
+                    busy: AtomicBool::new(false),
+                });
+                all.insert(session_id, new_session);
+                drop(all);
+                self.persist();
+            }
+        }
+    }
+
     /// Rename the active session for a key.
     pub fn rename_session(&self, key: &str, new_name: &str) -> bool {
         let active = self.active_keys.lock().unwrap();
@@ -517,6 +570,7 @@ impl SessionManager {
                     created_at: old.created_at,
                     updated_at: old.updated_at,
                     work_dir: old.work_dir.clone(),
+                    tmux_session: old.tmux_session.clone(),
                     busy: AtomicBool::new(old.is_busy()),
                 });
                 all.insert(session_id, new_session);
@@ -561,6 +615,7 @@ impl SessionManager {
                         created_at: old.created_at,
                         updated_at: Utc::now(),
                         work_dir: old.work_dir.clone(),
+                        tmux_session: old.tmux_session.clone(),
                         busy: AtomicBool::new(false),
                     });
                     all.insert(session_id, new_session);
@@ -783,6 +838,24 @@ mod tests {
         let s1 = mgr.get_or_create("user:alice");
         let s2 = mgr.get_or_create("user:alice");
         assert_eq!(s1.id, s2.id);
+    }
+
+    #[test]
+    fn set_work_dir_as_first_action_persists() {
+        // Regression: `/dir` as the FIRST message in a fresh channel used to be
+        // a silent no-op because no session existed yet. set_work_dir must now
+        // create the session and store the directory.
+        let (mgr, _tmp) = make_manager();
+        let key = "discord:brand-new-channel";
+        assert!(mgr.get_work_dir(key).is_none(), "precondition: no session yet");
+
+        mgr.set_work_dir(key, "/Users/me/Documents/project-x");
+
+        assert_eq!(
+            mgr.get_work_dir(key).as_deref(),
+            Some("/Users/me/Documents/project-x"),
+            "work_dir set before any session existed must persist"
+        );
     }
 
     #[test]

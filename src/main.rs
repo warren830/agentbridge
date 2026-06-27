@@ -13,6 +13,8 @@ mod daemon;
 mod dedup;
 mod engine;
 mod gateway;
+mod hook_receiver;
+mod hook_route;
 mod lock;
 mod outgoing_ratelimit;
 mod platforms;
@@ -57,6 +59,12 @@ enum Commands {
     Init,
     /// Check configuration health
     Doctor,
+    /// Install the Claude Code Stop/PostToolUse hook into ~/.claude/settings.json
+    HookInstall {
+        /// Port the hook receiver listens on (must match config; default 9123)
+        #[arg(long)]
+        port: Option<u16>,
+    },
     /// Manage background service
     Daemon {
         #[command(subcommand)]
@@ -147,6 +155,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Init => run_init().await,
         Commands::Doctor => run_doctor(cli.config).await,
+        Commands::HookInstall { port } => run_hook_install(cli.config, port).await,
         Commands::Daemon { action } => run_daemon(action),
         Commands::Relay { action } => run_relay(action).await,
         Commands::Sync { action } => run_sync(action),
@@ -196,14 +205,31 @@ async fn run_server(
     let relay_server = relay::RelayServer::new(relay_tx);
     relay_server.start().await?;
 
+    // Shared hook route registry: one localhost hook receiver routes Claude
+    // Code Stop/PostToolUse hooks to whichever project engine bound the
+    // matching work_dir, so all engines must share the same registry.
+    let hook_route = Arc::new(hook_route::HookRouteRegistry::new());
+
     // Use the NEW engine (architecture rewrite)
     let mut engines = Vec::new();
 
     for project in &cfg.projects {
         let mut eng = engine::Engine::new(project.clone(), cfg.clone());
+        eng.set_hook_route(Arc::clone(&hook_route));
         eng.start().await?;
         tracing::info!(name = %project.name, "project ready");
         engines.push(eng);
+    }
+
+    // Start the hook receiver (localhost) so bridged tmux+hook sessions can
+    // relay Claude Code's Stop hook back as chat text. Default port 9123.
+    let hook_port = cfg
+        .hook_receiver
+        .as_ref()
+        .map(|h| h.port)
+        .unwrap_or_else(config::default_hook_receiver_port);
+    if let Err(e) = hook_receiver::start(hook_port, Arc::clone(&hook_route)).await {
+        tracing::warn!(error = %e, port = hook_port, "hook receiver failed to start");
     }
 
     tracing::info!("all projects started, waiting for messages...");
@@ -621,6 +647,144 @@ projects:
     Ok(())
 }
 
+/// The hook relay script, embedded so `hook-install` is self-contained — it
+/// writes this out to a stable path and points Claude Code's settings at it.
+const HOOK_SCRIPT: &str = include_str!("../scripts/agentbridge_hook.py");
+
+/// Install (merge) the Claude Code Stop/PostToolUse hook into the user's global
+/// `~/.claude/settings.json`.
+///
+/// Merge-not-overwrite (BR-12): existing settings and other hooks are
+/// preserved; re-running is idempotent (the entry is matched by command and not
+/// duplicated). The configured port (BR-13) is baked into the hook command.
+async fn run_hook_install(config_path: Option<String>, port_override: Option<u16>) -> anyhow::Result<()> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("cannot resolve home directory"))?;
+
+    // Resolve the port: CLI flag > config hook_receiver.port > default 9123.
+    let port = match port_override {
+        Some(p) => p,
+        None => config::load(config_path.as_deref())
+            .ok()
+            .and_then(|c| c.hook_receiver.map(|h| h.port))
+            .unwrap_or_else(config::default_hook_receiver_port),
+    };
+
+    // Write the relay script to a stable path and reference it from settings.
+    let ab_dir = home.join(".agentbridge");
+    tokio::fs::create_dir_all(&ab_dir).await?;
+    let script_path = ab_dir.join("agentbridge_hook.py");
+    tokio::fs::write(&script_path, HOOK_SCRIPT).await?;
+    set_executable(&script_path).await;
+
+    let command = format!(
+        "python3 {} {}",
+        script_path.display(),
+        port
+    );
+
+    // Read existing settings (or start fresh), merge our hook, write back.
+    let settings_dir = home.join(".claude");
+    tokio::fs::create_dir_all(&settings_dir).await?;
+    let settings_path = settings_dir.join("settings.json");
+
+    let mut settings: serde_json::Value = match tokio::fs::read_to_string(&settings_path).await {
+        Ok(content) if !content.trim().is_empty() => serde_json::from_str(&content)
+            .map_err(|e| anyhow::anyhow!("~/.claude/settings.json is not valid JSON: {}", e))?,
+        _ => serde_json::json!({}),
+    };
+
+    if !settings.is_object() {
+        anyhow::bail!("~/.claude/settings.json must be a JSON object");
+    }
+
+    let mut added = false;
+    for event in ["Stop", "PostToolUse"] {
+        if merge_hook_event(&mut settings, event, &command) {
+            added = true;
+        }
+    }
+
+    // Atomic write: write to a temp file in the same dir, then rename over.
+    let serialized = serde_json::to_string_pretty(&settings)?;
+    let tmp_path = settings_dir.join("settings.json.agentbridge.tmp");
+    tokio::fs::write(&tmp_path, serialized.as_bytes()).await?;
+    tokio::fs::rename(&tmp_path, &settings_path).await?;
+
+    if added {
+        println!("Installed agentbridge hook (port {}).", port);
+    } else {
+        println!("agentbridge hook already installed (port {}); no change.", port);
+    }
+    println!("  script:   {}", script_path.display());
+    println!("  settings: {}", settings_path.display());
+    Ok(())
+}
+
+/// Ensure a hooks event array (e.g. `hooks.Stop`) contains an entry running our
+/// command. Returns `true` if an entry was added, `false` if it was already
+/// present (idempotency). The entry uses an empty matcher so it fires for all.
+fn merge_hook_event(settings: &mut serde_json::Value, event: &str, command: &str) -> bool {
+    let Some(root) = settings.as_object_mut() else {
+        return false;
+    };
+    let hooks = root
+        .entry("hooks")
+        .or_insert_with(|| serde_json::json!({}));
+    let hooks_obj = match hooks.as_object_mut() {
+        Some(o) => o,
+        None => {
+            // `hooks` exists but isn't an object — leave foreign config alone.
+            return false;
+        }
+    };
+    let arr = hooks_obj
+        .entry(event.to_string())
+        .or_insert_with(|| serde_json::json!([]));
+    let Some(arr) = arr.as_array_mut() else {
+        return false;
+    };
+
+    // Already installed? Match on our command appearing in any nested hook.
+    let already = arr.iter().any(|group| {
+        group
+            .get("hooks")
+            .and_then(|h| h.as_array())
+            .map(|inner| {
+                inner.iter().any(|h| {
+                    h.get("command").and_then(|c| c.as_str()) == Some(command)
+                })
+            })
+            .unwrap_or(false)
+    });
+    if already {
+        return false;
+    }
+
+    arr.push(serde_json::json!({
+        "matcher": "",
+        "hooks": [ { "type": "command", "command": command } ]
+    }));
+    true
+}
+
+/// Best-effort chmod +x on the relay script (Unix). On other platforms this is
+/// a no-op; python3 is invoked explicitly so the bit is not strictly required.
+async fn set_executable(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = tokio::fs::metadata(path).await {
+            let mut perms = meta.permissions();
+            perms.set_mode(0o755);
+            let _ = tokio::fs::set_permissions(path, perms).await;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+}
+
 /// Read a line from stdin with a prompt.
 fn prompt_input(prompt: &str) -> anyhow::Result<String> {
     print!("{}", prompt);
@@ -850,4 +1014,92 @@ async fn check_discord_token(token: &str) -> anyhow::Result<String> {
         .map_err(|e| anyhow::anyhow!("bad response: {}", e))?;
     let username = body.get("username").and_then(|v| v.as_str()).unwrap_or("unknown");
     Ok(username.to_string())
+}
+
+#[cfg(test)]
+mod hook_install_tests {
+    use super::*;
+
+    fn count_command_entries(settings: &serde_json::Value, event: &str, command: &str) -> usize {
+        settings["hooks"][event]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter(|g| {
+                        g.get("hooks")
+                            .and_then(|h| h.as_array())
+                            .map(|inner| {
+                                inner.iter().any(|h| {
+                                    h.get("command").and_then(|c| c.as_str()) == Some(command)
+                                })
+                            })
+                            .unwrap_or(false)
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn merge_into_empty_settings_adds_entry() {
+        let mut settings = serde_json::json!({});
+        let cmd = "python3 /home/me/.agentbridge/agentbridge_hook.py 9123";
+        assert!(merge_hook_event(&mut settings, "Stop", cmd));
+        assert_eq!(count_command_entries(&settings, "Stop", cmd), 1);
+    }
+
+    #[test]
+    fn merge_is_idempotent() {
+        let mut settings = serde_json::json!({});
+        let cmd = "python3 /h/agentbridge_hook.py 9123";
+        assert!(merge_hook_event(&mut settings, "Stop", cmd));
+        // Second call must NOT add a duplicate and must report no change.
+        assert!(!merge_hook_event(&mut settings, "Stop", cmd));
+        assert_eq!(count_command_entries(&settings, "Stop", cmd), 1);
+    }
+
+    #[test]
+    fn merge_preserves_existing_hooks_and_settings() {
+        // Existing unrelated settings + a foreign Stop hook must be kept.
+        let mut settings = serde_json::json!({
+            "model": "claude-opus",
+            "hooks": {
+                "Stop": [
+                    { "matcher": "", "hooks": [ { "type": "command", "command": "echo other" } ] }
+                ],
+                "PreToolUse": [
+                    { "matcher": "Bash", "hooks": [ { "type": "command", "command": "guard.sh" } ] }
+                ]
+            }
+        });
+        let cmd = "python3 /h/agentbridge_hook.py 9123";
+        assert!(merge_hook_event(&mut settings, "Stop", cmd));
+
+        // Our entry was added alongside the existing foreign Stop hook.
+        let stop = settings["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(stop.len(), 2, "should keep the foreign Stop hook and add ours");
+        assert_eq!(count_command_entries(&settings, "Stop", cmd), 1);
+        // Unrelated settings untouched.
+        assert_eq!(settings["model"], serde_json::json!("claude-opus"));
+        assert!(settings["hooks"]["PreToolUse"].is_array());
+    }
+
+    #[test]
+    fn merge_handles_both_events() {
+        let mut settings = serde_json::json!({});
+        let cmd = "python3 /h/agentbridge_hook.py 9123";
+        assert!(merge_hook_event(&mut settings, "Stop", cmd));
+        assert!(merge_hook_event(&mut settings, "PostToolUse", cmd));
+        assert_eq!(count_command_entries(&settings, "Stop", cmd), 1);
+        assert_eq!(count_command_entries(&settings, "PostToolUse", cmd), 1);
+    }
+
+    #[test]
+    fn merge_skips_when_hooks_is_not_object() {
+        // A malformed `hooks` (array instead of object) must be left alone.
+        let mut settings = serde_json::json!({ "hooks": [] });
+        let cmd = "python3 /h/agentbridge_hook.py 9123";
+        assert!(!merge_hook_event(&mut settings, "Stop", cmd));
+        assert!(settings["hooks"].is_array(), "foreign shape preserved");
+    }
 }

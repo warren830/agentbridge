@@ -104,17 +104,29 @@ impl StreamPreview {
 
     /// Get display text suitable for showing in a chat message.
     ///
-    /// If the text exceeds [`MAX_PREVIEW_LEN`] it is truncated from the start
-    /// so the most recent content is visible. A `▌` cursor is appended to
-    /// indicate the stream is still in progress.
+    /// If the text exceeds [`MAX_PREVIEW_LEN`] characters it is truncated from
+    /// the start so the most recent content is visible. A `▌` cursor is appended
+    /// to indicate the stream is still in progress.
+    ///
+    /// Truncation counts CHARACTERS, not bytes, and is char-boundary-safe:
+    /// agentbridge relays CJK chat text, and a raw byte slice
+    /// (`&text[text.len()-N..]`) panics when the cut lands inside a multibyte
+    /// codepoint — which it did, crashing the whole event loop on a long
+    /// Chinese reply.
     pub fn display_text(&self) -> String {
         let text = &self.full_text;
-        let display = if text.len() > MAX_PREVIEW_LEN {
-            &text[text.len() - MAX_PREVIEW_LEN..]
+        if text.chars().count() > MAX_PREVIEW_LEN {
+            let tail: String = {
+                // Keep the last MAX_PREVIEW_LEN chars (whole codepoints).
+                let mut chars: Vec<char> = text.chars().collect();
+                let start = chars.len() - MAX_PREVIEW_LEN;
+                chars.drain(..start);
+                chars.into_iter().collect()
+            };
+            format!("{}\u{258C}", tail)
         } else {
-            text.as_str()
-        };
-        format!("{}\u{258C}", display)
+            format!("{}\u{258C}", text)
+        }
     }
 
     /// Mark that a preview update was successfully sent to the platform.
@@ -320,6 +332,23 @@ mod tests {
         let content_without_cursor = &display[..display.len() - "\u{258C}".len()];
         assert_eq!(content_without_cursor.len(), MAX_PREVIEW_LEN);
         assert!(display.ends_with('\u{258C}'));
+    }
+
+    #[test]
+    fn display_text_truncates_long_cjk_without_panic() {
+        // Regression: a long Chinese reply truncated from the start used to
+        // panic (`byte index N is not a char boundary`), crashing the event
+        // loop so the turn's reply never reached the user. Truncation must be
+        // char-boundary-safe and count chars, not bytes.
+        let mut sp = StreamPreview::new();
+        let long_cjk: String = "当".repeat(MAX_PREVIEW_LEN + 500); // 3 bytes/char
+        sp.append_text(&long_cjk);
+
+        let display = sp.display_text(); // must not panic
+        // Last MAX_PREVIEW_LEN chars kept, plus the cursor.
+        assert_eq!(display.chars().count(), MAX_PREVIEW_LEN + 1);
+        assert!(display.ends_with('\u{258C}'));
+        assert!(display.starts_with('当'));
     }
 
     #[test]

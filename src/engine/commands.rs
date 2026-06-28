@@ -357,8 +357,10 @@ async fn cmd_cron(
                 tokens[0], tokens[1], tokens[2], tokens[3], tokens[4]
             );
             let prompt = tokens[5].to_string();
-            let description = if prompt.len() > 30 {
-                format!("{}...", &prompt[..30])
+            // Char-boundary-safe truncation: a raw &prompt[..30] panics when a
+            // CJK cron description is cut inside a multibyte char.
+            let description = if prompt.chars().count() > 30 {
+                format!("{}...", prompt.chars().take(30).collect::<String>())
             } else {
                 prompt.clone()
             };

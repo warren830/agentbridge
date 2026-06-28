@@ -1688,8 +1688,14 @@ fn chunk_message(text: &str, max_len: usize) -> Vec<&str> {
             break;
         }
 
-        // Try to split at the last newline within max_len
-        let search_range = &remaining[..max_len.min(remaining.len())];
+        // Try to split at the last newline within max_len. Floor to a char
+        // boundary first — `&remaining[..max_len]` panics if byte max_len lands
+        // inside a multibyte (CJK) char.
+        let mut bound = max_len.min(remaining.len());
+        while bound > 0 && !remaining.is_char_boundary(bound) {
+            bound -= 1;
+        }
+        let search_range = &remaining[..bound];
         let split_at = search_range
             .rfind('\n')
             .map(|i| i + 1) // include the newline in the current chunk

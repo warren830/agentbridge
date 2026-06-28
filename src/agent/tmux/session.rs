@@ -948,31 +948,96 @@ fn contains_selection_menu(lines: &[String]) -> bool {
     has_footer && has_numbered_option
 }
 
-/// Extract a selection menu (the question through the numbered options) for
-/// relaying to chat. The `❯` cursor is stripped so the text is identical
-/// regardless of which option the cursor currently sits on — this keeps the
-/// dedup stable as the cursor moves, so the menu is relayed once, not per move.
+/// Numbered-option digit (1-9) rendered as a keycap emoji, for the menu format.
+fn keycap(n: u32) -> Option<&'static str> {
+    match n {
+        1 => Some("1\u{fe0f}\u{20e3}"),
+        2 => Some("2\u{fe0f}\u{20e3}"),
+        3 => Some("3\u{fe0f}\u{20e3}"),
+        4 => Some("4\u{fe0f}\u{20e3}"),
+        5 => Some("5\u{fe0f}\u{20e3}"),
+        6 => Some("6\u{fe0f}\u{20e3}"),
+        7 => Some("7\u{fe0f}\u{20e3}"),
+        8 => Some("8\u{fe0f}\u{20e3}"),
+        9 => Some("9\u{fe0f}\u{20e3}"),
+        _ => None,
+    }
+}
+
+/// If a (cursor-stripped) line starts a numbered option (`1. foo`), return
+/// `(number, rest)`; else `None`.
+fn parse_option_line(t: &str) -> Option<(u32, &str)> {
+    let dot = t.find('.')?;
+    let (num, rest) = t.split_at(dot);
+    let n: u32 = num.parse().ok()?;
+    Some((n, rest[1..].trim_start()))
+}
+
+/// Render a selection menu (AskUserQuestion chooser) into a phone-friendly,
+/// icon-blocked message: the question with a ❓ header, each option as a bold
+/// keycap line, and sub-descriptions as `·` bullets. The `❯` cursor is stripped
+/// so the text is identical regardless of which option the cursor sits on —
+/// keeping dedup stable as the cursor moves (relayed once, not per move).
 fn extract_selection_menu(lines: &[String]) -> String {
-    let mut out = Vec::new();
+    // First pass: collect the meaningful lines (cursor/chrome stripped), in
+    // order, splitting into the question region (before option 1) and options.
+    let mut cleaned: Vec<String> = Vec::new();
     for line in lines {
         let t = line.trim();
         if t.is_empty() {
             continue;
         }
-        // Stop at the footer — the keybinding hint is noise on a phone.
         if t.contains("Enter to select")
             || (t.contains("to navigate") && t.contains("to cancel"))
         {
             break;
         }
-        // Drop horizontal rules and the tab-strip arrows row.
+        // Horizontal rules.
         if t.chars().all(|c| c == '─' || c == '╌') {
             continue;
         }
-        // Strip the moving cursor so the snapshot is position-independent.
-        let cleaned = t.trim_start_matches('❯').trim_start();
-        out.push(cleaned.to_string());
+        // Tab-strip row (e.g. "← ☐ 预填策略 ☐ 谁来写 ✔ Submit →") — UI chrome.
+        if t.contains('☐') || t.contains('☑') || t.contains("Submit") {
+            continue;
+        }
+        cleaned.push(t.trim_start_matches('❯').trim_start().to_string());
     }
+
+    let mut out: Vec<String> = Vec::new();
+    let mut seen_option = false;
+    for t in &cleaned {
+        match parse_option_line(t) {
+            Some((n, rest)) => {
+                // Drop the trailing meta-options the phone can't use as-is.
+                let low = rest.to_lowercase();
+                if low.starts_with("type something") || low.starts_with("chat about this") {
+                    continue;
+                }
+                seen_option = true;
+                let icon = keycap(n).unwrap_or("•");
+                out.push(format!("{} **{}**", icon, rest));
+            }
+            None => {
+                if seen_option {
+                    // Indented sub-description under the current option.
+                    out.push(format!("   · {}", t));
+                } else {
+                    // Question region (before any option). First line gets the
+                    // ❓ header; following lines are sub-text of the question.
+                    if out.is_empty() {
+                        out.push(format!("\u{2753} **{}**", t));
+                    } else {
+                        out.push(t.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    if out.is_empty() {
+        return String::new();
+    }
+    out.push("\n\u{1f4ac} 直接回复序号选择".to_string());
     out.join("\n").trim().to_string()
 }
 
@@ -1033,12 +1098,17 @@ mod tests {
         let a = extract_selection_menu(&selection_menu_screen(0));
         let b = extract_selection_menu(&selection_menu_screen(3));
         assert_eq!(a, b, "menu text must be stable across cursor moves");
-        // Content present, footer + rules + cursor stripped.
+        // Icon-blocked format: question gets a ❓ header, options become bold
+        // keycap lines, cursor/chrome stripped.
+        assert!(a.contains("\u{2753}"), "question header present: {a}");
         assert!(a.contains("decide_prefill 的预填策略用哪个?"), "got: {a}");
-        assert!(a.contains("1. 分层(推荐)"), "got: {a}");
+        assert!(a.contains("1\u{fe0f}\u{20e3}"), "option 1 keycap: {a}");
+        assert!(a.contains("**分层(推荐)**"), "option text bold: {a}");
+        assert!(a.contains("\u{1f4ac} 直接回复序号选择"), "reply hint: {a}");
         assert!(!a.contains('❯'));
         assert!(!a.contains("Enter to select"));
         assert!(!a.contains("──"));
+        assert!(!a.contains("Submit"), "tab strip dropped: {a}");
     }
 
     #[test]

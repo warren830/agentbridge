@@ -178,14 +178,24 @@ async fn handle_hook_event(
         return StatusCode::OK;
     };
 
-    // On PostToolUse, first recover the inter-tool thinking/text the model
-    // produced since the last hook and relay it as ReplyChunk events — BEFORE
-    // the ToolUse, so the reasoning reads as leading into the tool. Stop does
-    // NOT flush: it already carries the final reply in last_assistant_message,
-    // and flushing there would duplicate the tail (Decision 2).
-    if payload.hook_event_name.as_deref() == Some("PostToolUse") {
-        if let Some(path) = payload.transcript_path.as_deref() {
-            flush_transcript(&state.registry, &payload, path, &tx).await;
+    // Transcript handling per event:
+    // - PostToolUse: relay the inter-tool thinking/text produced since the last
+    //   hook as ReplyChunk events, BEFORE the ToolUse, and advance the cursor.
+    // - Stop: do NOT relay (the final reply ships via last_assistant_message,
+    //   relaying would duplicate it) — but DO advance the cursor past the
+    //   turn's tail. The final reply text lands in the transcript AFTER the last
+    //   PostToolUse, so without this the cursor lags and the next turn's first
+    //   flush re-emits this turn's tail (observed: "last turn's message shows up
+    //   in the new one").
+    if let Some(path) = payload.transcript_path.as_deref() {
+        match payload.hook_event_name.as_deref() {
+            Some("PostToolUse") => {
+                flush_transcript(&state.registry, &payload, path, &tx, true).await;
+            }
+            Some("Stop") => {
+                flush_transcript(&state.registry, &payload, path, &tx, false).await;
+            }
+            _ => {}
         }
     }
 
@@ -206,17 +216,24 @@ async fn handle_hook_event(
     StatusCode::OK
 }
 
-/// Read the transcript blocks produced since this session's cursor and relay
-/// each as a `ReplyChunk`, then advance the cursor. The whole
+/// Read the transcript blocks produced since this session's cursor, optionally
+/// relay each as a `ReplyChunk`, then advance the cursor. The whole
 /// "lock cursor → read → advance" runs under the per-session cursor lock, so
-/// concurrent PostToolUse hooks for one session can't relay the same blocks
-/// (the read-modify-write race). Best-effort: any failure leaves the existing
+/// concurrent hooks for one session can't double-process the same blocks (the
+/// read-modify-write race). Best-effort: any failure leaves the existing
 /// ToolUse/Stop relay untouched.
+///
+/// `relay` controls whether the blocks are sent to chat:
+/// - `true`  (PostToolUse): send the inter-tool thinking/text, then advance.
+/// - `false` (Stop): DON'T send — the final reply ships via
+///   `last_assistant_message` — but still advance the cursor past the turn's
+///   tail so the next turn doesn't re-emit it.
 async fn flush_transcript(
     registry: &HookRouteRegistry,
     payload: &HookPayload,
     transcript_path: &str,
     tx: &mpsc::Sender<AgentEvent>,
+    relay: bool,
 ) {
     let Some(cursor) = registry.transcript_cursor(payload.tmux_session.as_deref(), payload.cwd.as_deref())
     else {
@@ -225,25 +242,32 @@ async fn flush_transcript(
     // Hold the cursor lock across the read so the critical section is serialized.
     let mut guard = cursor.lock().await;
     let result = crate::transcript::read_blocks_after(transcript_path, guard.as_deref()).await;
-    if result.blocks.is_empty() {
-        return;
-    }
-    let n = result.blocks.len();
-    for block in result.blocks {
-        let event = AgentEvent::ReplyChunk {
-            content: block.text,
-            thinking: matches!(block.kind, crate::transcript::BlockKind::Thinking),
-        };
-        if tx.send(event).await.is_err() {
-            // Consumer gone; stop and don't advance — a fresh consumer can
-            // re-read from the same cursor next time.
-            return;
+
+    // Always advance the cursor to whatever we read — even when not relaying —
+    // so Stop catches the cursor up past the turn's final text.
+    let advance_to = result.last_uuid.clone();
+
+    if relay {
+        let n = result.blocks.len();
+        for block in result.blocks {
+            let event = AgentEvent::ReplyChunk {
+                content: block.text,
+                thinking: matches!(block.kind, crate::transcript::BlockKind::Thinking),
+            };
+            if tx.send(event).await.is_err() {
+                // Consumer gone; stop WITHOUT advancing — a fresh consumer can
+                // re-read from the same cursor next time.
+                return;
+            }
+        }
+        if n > 0 {
+            tracing::info!(blocks = n, "relayed transcript reply chunks");
         }
     }
-    if let Some(uuid) = result.last_uuid {
+
+    if let Some(uuid) = advance_to {
         *guard = Some(uuid);
     }
-    tracing::info!(blocks = n, "relayed transcript reply chunks");
 }
 
 #[cfg(test)]
@@ -356,7 +380,7 @@ mod tests {
         p.transcript_path = Some(path.clone());
 
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(16);
-        flush_transcript(&reg, &p, &path, &tx).await;
+        flush_transcript(&reg, &p, &path, &tx, true).await;
 
         // thinking then text then text → 3 ReplyChunks in order.
         let mut got = vec![];
@@ -371,8 +395,40 @@ mod tests {
         assert_eq!(got[2], ("改 App.tsx".to_string(), false));
 
         // Second flush with the advanced cursor relays nothing (dedup).
-        flush_transcript(&reg, &p, &path, &tx).await;
+        flush_transcript(&reg, &p, &path, &tx, true).await;
         assert!(rx.try_recv().is_err(), "no repeats on second flush");
+    }
+
+    #[tokio::test]
+    async fn stop_advances_cursor_without_relaying() {
+        // Regression: Stop must NOT relay (final reply ships via
+        // last_assistant_message) but MUST advance the cursor past the turn's
+        // tail, or the next turn's first PostToolUse re-emits this turn's final
+        // text ("last turn's message shows up in the new one").
+        let reg = HookRouteRegistry::new();
+        let (_d, path) = write_transcript(&[
+            &assistant_jsonl("a1", "工具前的话", ""),
+            &assistant_jsonl("a2", "最终回复(只该走 last_assistant_message)", ""),
+        ]);
+        let mut p = payload("Stop");
+        p.tmux_session = Some("sess-stop".to_string());
+        p.transcript_path = Some(path.clone());
+
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(8);
+        // Stop flush: relay=false.
+        flush_transcript(&reg, &p, &path, &tx, false).await;
+        assert!(rx.try_recv().is_err(), "Stop must not relay any ReplyChunk");
+
+        // Cursor advanced to a2 → a subsequent PostToolUse flush sees nothing
+        // old (no leak of this turn's tail into the next turn).
+        let mut p2 = payload("PostToolUse");
+        p2.tmux_session = Some("sess-stop".to_string());
+        p2.transcript_path = Some(path.clone());
+        flush_transcript(&reg, &p2, &path, &tx, true).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "Stop must have advanced the cursor so the tail isn't re-emitted"
+        );
     }
 
     #[tokio::test]
@@ -381,7 +437,7 @@ mod tests {
         let mut p = payload("PostToolUse");
         p.tmux_session = Some("sess-x".to_string());
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(4);
-        flush_transcript(&reg, &p, "/no/such/transcript.jsonl", &tx).await;
+        flush_transcript(&reg, &p, "/no/such/transcript.jsonl", &tx, true).await;
         assert!(rx.try_recv().is_err(), "unreadable transcript → no events");
     }
 

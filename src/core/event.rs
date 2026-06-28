@@ -31,6 +31,19 @@ pub enum AgentEvent {
         content: String,
     },
 
+    /// A chunk of assistant reply (thinking or text) recovered from the
+    /// transcript between tool calls, in hook mode. Unlike `Text`/`Thinking`,
+    /// these accumulate into a single self-editing chat message and never
+    /// freeze/detach the live preview — so a long, tool-heavy turn shows the
+    /// model's reasoning without spamming the channel or breaking the in-place
+    /// tool-progress message.
+    ReplyChunk {
+        content: String,
+        /// `true` for a `thinking` block (rendered with a 💭 marker), `false`
+        /// for a user-facing `text` block.
+        thinking: bool,
+    },
+
     /// The agent is invoking a tool.
     ToolUse {
         id: String,

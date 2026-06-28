@@ -74,6 +74,13 @@ pub async fn process_agent_events(
     // progress message handle and the running list of tools this turn.
     let mut progress_handle: Option<Box<dyn PreviewHandle>> = None;
     let mut progress_tools: Vec<String> = Vec::new();
+    // Accumulating reply-text message (ReplyChunk events, hook mode): a SEPARATE
+    // self-editing message holding the turn's inter-tool thinking/text. Kept
+    // distinct from progress_handle so the two never freeze each other; once the
+    // buffer nears the platform message cap it is finalized and a fresh one
+    // continues (saturate-then-new), so nothing is truncated.
+    let mut reply_handle: Option<Box<dyn PreviewHandle>> = None;
+    let mut reply_buf: String = String::new();
 
     let mut result_info = EventLoopResult {
         final_text: String::new(),
@@ -195,6 +202,21 @@ pub async fn process_agent_events(
                         content
                     };
                     let _ = platform.reply(ctx, &format!("🧠 {}", truncated)).await;
+                }
+            }
+
+            // ----- Reply chunk (transcript thinking/text, hook mode) -----
+            AgentEvent::ReplyChunk { content, thinking } => {
+                if !content.trim().is_empty() {
+                    append_reply_chunk(
+                        platform,
+                        ctx,
+                        &mut reply_handle,
+                        &mut reply_buf,
+                        &content,
+                        thinking,
+                    )
+                    .await;
                 }
             }
 
@@ -417,6 +439,11 @@ pub async fn process_agent_events(
                 }
                 progress_tools.clear();
 
+                // The accumulating reply message (reply_handle/reply_buf) needs
+                // no reset here: the loop `break`s on Result, so these locals are
+                // dropped, and the next turn is a fresh `process_agent_events`
+                // call with new state. The finalized message stays in the chat.
+
                 preview.finish();
 
                 let mut final_text = if content.is_empty() && preview.was_active() {
@@ -538,6 +565,70 @@ fn render_progress(tools: &[String], done: bool) -> String {
         lines.push(format!("{} {}. {}", marker, idx, t));
     }
     lines.join("\n")
+}
+
+// ---------------------------------------------------------------------------
+// Accumulating reply message (ReplyChunk, hook mode)
+// ---------------------------------------------------------------------------
+
+/// Soft cap for the accumulating reply message. Below the platform hard limit
+/// (Discord 2000) with headroom for the next chunk and a marker, so we finalize
+/// and start a fresh message before any single edit would overflow.
+const REPLY_MSG_CAP: usize = 1900;
+
+/// Append a transcript reply chunk to the accumulating message, editing it in
+/// place. When the buffer would exceed [`REPLY_MSG_CAP`] the current message is
+/// left finalized and a fresh one is started with this chunk (saturate-then-new),
+/// so the full reply is preserved across several messages and nothing is
+/// truncated. All length checks are char-boundary-safe (CJK text is common).
+async fn append_reply_chunk(
+    platform: &Arc<dyn PlatformCapabilities>,
+    ctx: &dyn ReplyCtx,
+    handle: &mut Option<Box<dyn PreviewHandle>>,
+    buf: &mut String,
+    content: &str,
+    thinking: bool,
+) {
+    let Some(updater) = platform.as_message_updater() else {
+        // No editable-message capability: fall back to a one-off reply so the
+        // text is at least delivered.
+        let _ = platform.reply(ctx, content).await;
+        return;
+    };
+
+    let piece = if thinking {
+        format!("💭 {}", content.trim())
+    } else {
+        content.trim().to_string()
+    };
+
+    // Would appending overflow the current message? Count chars, not bytes.
+    let projected = buf.chars().count() + 1 + piece.chars().count();
+    let start_fresh = handle.is_none() || projected > REPLY_MSG_CAP;
+
+    if start_fresh {
+        // Finalize the current message (leave it as the trace) and open a new
+        // one. A single chunk larger than the cap still goes out whole — better
+        // an over-long message than a split mid-thought.
+        *buf = piece;
+        match updater.send_preview(ctx, buf).await {
+            Ok(h) => *handle = Some(h),
+            Err(e) => {
+                tracing::warn!(error = %e, "reply chunk send_preview failed");
+                *handle = None;
+            }
+        }
+    } else {
+        if !buf.is_empty() {
+            buf.push('\n');
+        }
+        buf.push_str(&piece);
+        if let Some(h) = handle.as_ref() {
+            if let Err(e) = updater.update_preview(h.as_ref(), buf).await {
+                tracing::warn!(error = %e, "reply chunk update_preview failed");
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -779,6 +870,13 @@ mod tests {
         }
     }
 
+    fn reply_ev(content: &str, thinking: bool) -> AgentEvent {
+        AgentEvent::ReplyChunk {
+            content: content.to_string(),
+            thinking,
+        }
+    }
+
     async fn drive(events: Vec<AgentEvent>, inplace: bool) -> Vec<Rec> {
         let tp = Arc::new(TestPlatform::new());
         let rec = Arc::clone(&tp.rec);
@@ -922,6 +1020,72 @@ mod tests {
         assert!(
             !rec.iter().any(|r| matches!(r, Rec::PreviewCreate(t) if t.contains("处理中"))),
             "no progress preview in non-inplace mode: {rec:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reply_chunks_accumulate_into_one_message() {
+        // Several thinking/text chunks under the cap → ONE preview, edited in
+        // place, accumulating all of them (with the 💭 marker on thinking).
+        let rec = drive(
+            vec![
+                reply_ev("先看前端结构", true),     // thinking
+                reply_ev("我打算改 App.tsx", false), // text
+                reply_ev("改完跑测试", false),       // text
+                result_ev("最终答案"),
+            ],
+            true,
+        )
+        .await;
+
+        let creates = rec.iter().filter(|r| matches!(r, Rec::PreviewCreate(_))).count();
+        assert_eq!(creates, 1, "all chunks share one message: {rec:?}");
+
+        // The last edit holds all three pieces, thinking marked with 💭.
+        let last = rec
+            .iter()
+            .rev()
+            .find_map(|r| match r {
+                Rec::PreviewUpdate(t) | Rec::PreviewCreate(t) => Some(t.clone()),
+                _ => None,
+            })
+            .expect("a preview write");
+        assert!(last.contains("💭 先看前端结构"), "thinking marked: {last}");
+        assert!(last.contains("我打算改 App.tsx"), "{last}");
+        assert!(last.contains("改完跑测试"), "{last}");
+        // Final answer still delivered as its own reply (not part of the chunk msg).
+        assert!(
+            rec.iter().any(|r| matches!(r, Rec::Reply(c) if c.contains("最终答案"))),
+            "final answer replied: {rec:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reply_chunks_saturate_then_open_new_message() {
+        // A chunk that pushes the buffer past the cap starts a fresh message
+        // (saturate-then-new), so nothing is truncated.
+        let big = "字".repeat(1000); // 2 of these (+marker) exceed REPLY_MSG_CAP(1900)
+        let rec = drive(
+            vec![
+                reply_ev(&big, false),
+                reply_ev(&big, false),
+                result_ev("done"),
+            ],
+            true,
+        )
+        .await;
+
+        let creates = rec.iter().filter(|r| matches!(r, Rec::PreviewCreate(_))).count();
+        assert_eq!(creates, 2, "second chunk opens a new message: {rec:?}");
+    }
+
+    #[tokio::test]
+    async fn reply_chunks_do_not_create_progress_message() {
+        // A reply-only turn (no tools) must not produce a tool-progress message.
+        let rec = drive(vec![reply_ev("just thinking", true), result_ev("done")], true).await;
+        assert!(
+            !rec.iter().any(|r| matches!(r, Rec::PreviewCreate(t) if t.contains("处理中") || t.contains("完成"))),
+            "no progress message from reply chunks: {rec:?}"
         );
     }
 }

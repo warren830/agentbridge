@@ -22,6 +22,7 @@ mod ratelimit;
 mod relay;
 mod speech;
 mod sync;
+mod transcript;
 mod webhook;
 
 use clap::{Parser, Subcommand};

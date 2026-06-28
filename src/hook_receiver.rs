@@ -15,6 +15,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
 use serde::Deserialize;
+use tokio::sync::mpsc;
 
 use crate::core::event::AgentEvent;
 use crate::hook_route::HookRouteRegistry;
@@ -39,6 +40,9 @@ pub struct HookPayload {
     pub tmux_session: Option<String>,
     /// Working directory of the Claude Code instance; the fallback routing key.
     pub cwd: Option<String>,
+    /// Path to this session's JSONL transcript. Claude Code includes it on
+    /// every hook payload; used to recover inter-tool thinking/text.
+    pub transcript_path: Option<String>,
     /// Stop: the assistant's final message for the turn.
     pub last_assistant_message: Option<String>,
     /// PostToolUse: the tool that just ran.
@@ -174,6 +178,17 @@ async fn handle_hook_event(
         return StatusCode::OK;
     };
 
+    // On PostToolUse, first recover the inter-tool thinking/text the model
+    // produced since the last hook and relay it as ReplyChunk events — BEFORE
+    // the ToolUse, so the reasoning reads as leading into the tool. Stop does
+    // NOT flush: it already carries the final reply in last_assistant_message,
+    // and flushing there would duplicate the tail (Decision 2).
+    if payload.hook_event_name.as_deref() == Some("PostToolUse") {
+        if let Some(path) = payload.transcript_path.as_deref() {
+            flush_transcript(&state.registry, &payload, path, &tx).await;
+        }
+    }
+
     let Some(event) = map_hook(&payload) else {
         // Unmapped event type or empty turn — nothing to relay.
         return StatusCode::OK;
@@ -191,6 +206,46 @@ async fn handle_hook_event(
     StatusCode::OK
 }
 
+/// Read the transcript blocks produced since this session's cursor and relay
+/// each as a `ReplyChunk`, then advance the cursor. The whole
+/// "lock cursor → read → advance" runs under the per-session cursor lock, so
+/// concurrent PostToolUse hooks for one session can't relay the same blocks
+/// (the read-modify-write race). Best-effort: any failure leaves the existing
+/// ToolUse/Stop relay untouched.
+async fn flush_transcript(
+    registry: &HookRouteRegistry,
+    payload: &HookPayload,
+    transcript_path: &str,
+    tx: &mpsc::Sender<AgentEvent>,
+) {
+    let Some(cursor) = registry.transcript_cursor(payload.tmux_session.as_deref(), payload.cwd.as_deref())
+    else {
+        return;
+    };
+    // Hold the cursor lock across the read so the critical section is serialized.
+    let mut guard = cursor.lock().await;
+    let result = crate::transcript::read_blocks_after(transcript_path, guard.as_deref()).await;
+    if result.blocks.is_empty() {
+        return;
+    }
+    let n = result.blocks.len();
+    for block in result.blocks {
+        let event = AgentEvent::ReplyChunk {
+            content: block.text,
+            thinking: matches!(block.kind, crate::transcript::BlockKind::Thinking),
+        };
+        if tx.send(event).await.is_err() {
+            // Consumer gone; stop and don't advance — a fresh consumer can
+            // re-read from the same cursor next time.
+            return;
+        }
+    }
+    if let Some(uuid) = result.last_uuid {
+        *guard = Some(uuid);
+    }
+    tracing::info!(blocks = n, "relayed transcript reply chunks");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,6 +256,7 @@ mod tests {
             session_id: Some("sess-123".to_string()),
             tmux_session: None,
             cwd: Some("/tmp/project".to_string()),
+            transcript_path: None,
             last_assistant_message: None,
             tool_name: None,
             tool_input: None,
@@ -264,6 +320,69 @@ mod tests {
         p.tool_name = Some("   ".to_string());
         p.tool_input = Some(serde_json::json!({ "command": "ls" }));
         assert!(map_hook(&p).is_none());
+    }
+
+    // --- flush_transcript orchestration ----------------------------------
+
+    /// Write a tiny assistant-only transcript to a temp file, returning its path.
+    fn write_transcript(lines: &[&str]) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        let p = path.to_string_lossy().to_string();
+        (dir, p)
+    }
+
+    fn assistant_jsonl(uuid: &str, text: &str, thinking: &str) -> String {
+        let mut content = vec![];
+        if !thinking.is_empty() {
+            content.push(serde_json::json!({"type":"thinking","thinking":thinking,"signature":"s"}));
+        }
+        if !text.is_empty() {
+            content.push(serde_json::json!({"type":"text","text":text}));
+        }
+        serde_json::json!({"type":"assistant","uuid":uuid,"message":{"content":content}}).to_string()
+    }
+
+    #[tokio::test]
+    async fn flush_relays_chunks_and_advances_cursor() {
+        let reg = HookRouteRegistry::new();
+        let (_d, path) = write_transcript(&[
+            &assistant_jsonl("a1", "我看一下", "先想想"),
+            &assistant_jsonl("a2", "改 App.tsx", ""),
+        ]);
+        let mut p = payload("PostToolUse");
+        p.tmux_session = Some("sess-flush".to_string());
+        p.transcript_path = Some(path.clone());
+
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(16);
+        flush_transcript(&reg, &p, &path, &tx).await;
+
+        // thinking then text then text → 3 ReplyChunks in order.
+        let mut got = vec![];
+        while let Ok(ev) = rx.try_recv() {
+            if let AgentEvent::ReplyChunk { content, thinking } = ev {
+                got.push((content, thinking));
+            }
+        }
+        assert_eq!(got.len(), 3, "got: {got:?}");
+        assert_eq!(got[0], ("先想想".to_string(), true));
+        assert_eq!(got[1], ("我看一下".to_string(), false));
+        assert_eq!(got[2], ("改 App.tsx".to_string(), false));
+
+        // Second flush with the advanced cursor relays nothing (dedup).
+        flush_transcript(&reg, &p, &path, &tx).await;
+        assert!(rx.try_recv().is_err(), "no repeats on second flush");
+    }
+
+    #[tokio::test]
+    async fn flush_missing_transcript_is_silent() {
+        let reg = HookRouteRegistry::new();
+        let mut p = payload("PostToolUse");
+        p.tmux_session = Some("sess-x".to_string());
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(4);
+        flush_transcript(&reg, &p, "/no/such/transcript.jsonl", &tx).await;
+        assert!(rx.try_recv().is_err(), "unreadable transcript → no events");
     }
 
     #[test]
@@ -384,6 +503,7 @@ mod tests {
             session_id: None,
             tmux_session: None,
             cwd: None,
+            transcript_path: None,
             last_assistant_message: None,
             tool_name: None,
             tool_input: None,

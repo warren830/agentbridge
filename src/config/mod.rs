@@ -139,6 +139,13 @@ pub struct ProjectConfig {
 /// Controls what intermediate output (thinking, tool use) is shown to the user.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DisplayConfig {
+    /// Master switch for "show the work": tool-use progress AND thinking /
+    /// inter-tool text. When false, only the final reply is sent — the channel
+    /// stays quiet during a turn. The finer `thinking_messages` / `tool_messages`
+    /// switches still apply when this is on. Default: true (show the work).
+    /// Toggle per-channel at runtime with `/verbose`.
+    #[serde(default = "default_true")]
+    pub verbose: bool,
     /// Show thinking/chain-of-thought messages (default: true).
     #[serde(default = "default_true")]
     pub thinking_messages: bool,
@@ -163,6 +170,7 @@ pub struct DisplayConfig {
 impl Default for DisplayConfig {
     fn default() -> Self {
         Self {
+            verbose: true,
             thinking_messages: true,
             thinking_max_len: 200,
             tool_messages: true,

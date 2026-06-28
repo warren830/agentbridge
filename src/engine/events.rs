@@ -193,7 +193,9 @@ pub async fn process_agent_events(
 
             // ----- Thinking -----
             AgentEvent::Thinking { content } => {
-                if display.thinking_messages && !content.is_empty() {
+                // `verbose` is the master "show the work" switch; thinking is
+                // part of the work, so it is suppressed when verbose is off.
+                if display.verbose && display.thinking_messages && !content.is_empty() {
                     freeze_and_detach_preview(platform, &mut preview, &mut handle).await;
                     let max = display.thinking_max_len;
                     let truncated: String = if content.chars().count() > max {
@@ -207,7 +209,9 @@ pub async fn process_agent_events(
 
             // ----- Reply chunk (transcript thinking/text, hook mode) -----
             AgentEvent::ReplyChunk { content, thinking } => {
-                if !content.trim().is_empty() {
+                // Gated by the master verbose switch: this is the inter-tool
+                // "show the work" stream. When quiet, only the final reply ships.
+                if display.verbose && !content.trim().is_empty() {
                     append_reply_chunk(
                         platform,
                         ctx,
@@ -223,8 +227,9 @@ pub async fn process_agent_events(
             // ----- Tool use notification -----
             AgentEvent::ToolUse { tool, input, .. } => {
                 tool_count += 1;
-                if !display.tool_messages {
-                    // tool messages disabled — nothing to show either way.
+                if !display.verbose || !display.tool_messages {
+                    // Quiet (verbose off) or tool messages disabled — count the
+                    // tool (the Result branch needs the count) but show nothing.
                 } else if tool_progress_inplace {
                     // Coalesce into one in-place-edited progress message: append
                     // this tool to the running list and edit the single message,
@@ -273,7 +278,7 @@ pub async fn process_agent_events(
 
             // ----- Tool result -----
             AgentEvent::ToolResult { output, is_error, .. } => {
-                if display.tool_messages && !output.is_empty() {
+                if display.verbose && display.tool_messages && !output.is_empty() {
                     let icon = if is_error { "💥" } else { "✓" };
                     let max = display.tool_max_len;
                     let truncated: String = if output.chars().count() > max {
@@ -878,6 +883,14 @@ mod tests {
     }
 
     async fn drive(events: Vec<AgentEvent>, inplace: bool) -> Vec<Rec> {
+        drive_with_display(events, inplace, DisplayConfig::default()).await
+    }
+
+    async fn drive_with_display(
+        events: Vec<AgentEvent>,
+        inplace: bool,
+        display: DisplayConfig,
+    ) -> Vec<Rec> {
         let tp = Arc::new(TestPlatform::new());
         let rec = Arc::clone(&tp.rec);
         let platform: Arc<dyn PlatformCapabilities> = tp;
@@ -894,7 +907,6 @@ mod tests {
         let mut approve_all = false;
         let pending = Arc::new(AtomicBool::new(false));
         let stopped = Arc::new(AtomicBool::new(false));
-        let display = DisplayConfig::default();
         let (btx, _brx) = broadcast::channel(32);
         let btx = Arc::new(btx);
 
@@ -1086,6 +1098,40 @@ mod tests {
         assert!(
             !rec.iter().any(|r| matches!(r, Rec::PreviewCreate(t) if t.contains("处理中") || t.contains("完成"))),
             "no progress message from reply chunks: {rec:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn verbose_off_suppresses_progress_and_reply_chunks_but_keeps_final() {
+        // The /verbose-off contract: tool progress + thinking/text are silenced,
+        // only the final reply ships.
+        let quiet = DisplayConfig { verbose: false, ..Default::default() };
+        let rec = drive_with_display(
+            vec![
+                reply_ev("内部思考", true),
+                tool_ev("Bash", "ls"),
+                tool_ev("Edit", "/x/a.rs"),
+                reply_ev("中间说明", false),
+                result_ev("最终答案"),
+            ],
+            true,
+            quiet,
+        )
+        .await;
+
+        // No progress preview, no reply-chunk preview during the turn.
+        assert!(
+            !rec.iter().any(|r| matches!(r, Rec::PreviewCreate(_) | Rec::PreviewUpdate(_))),
+            "verbose off must emit no in-progress messages: {rec:?}"
+        );
+        assert!(
+            !rec.iter().any(|r| matches!(r, Rec::Reply(c) if c.starts_with("⚡") || c.starts_with("💭"))),
+            "verbose off must not relay tool/thinking chatter: {rec:?}"
+        );
+        // The final answer is still delivered.
+        assert!(
+            rec.iter().any(|r| matches!(r, Rec::Reply(c) if c.contains("最终答案"))),
+            "final reply must still ship when quiet: {rec:?}"
         );
     }
 }

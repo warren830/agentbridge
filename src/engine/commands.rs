@@ -78,6 +78,7 @@ fn cmd_help(custom_commands: &[CommandConfig]) -> String {
 /delete - Delete current session\n\
 /name [name] - Rename current session\n\
 /stop - Interrupt current task (keeps the session)\n\
+/verbose [on|off] - Toggle showing tool progress + thinking\n\
 /compress - Compress context\n\
 /history - Session history\n\
 /btw <msg> - Inject mid-turn message\n\

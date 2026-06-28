@@ -62,6 +62,9 @@ struct EngineInteractiveState {
     stopped: Arc<AtomicBool>,
     /// When true, auto-approve all subsequent permission requests for this session.
     approve_all: bool,
+    /// Per-channel override for the `verbose` display switch, set by `/verbose`.
+    /// `None` means "follow config default"; `Some(b)` overrides it at runtime.
+    verbose_override: Option<bool>,
 }
 
 impl EngineInteractiveState {
@@ -74,6 +77,7 @@ impl EngineInteractiveState {
             has_pending_permission: Arc::new(AtomicBool::new(false)),
             stopped: Arc::new(AtomicBool::new(false)),
             approve_all: false,
+            verbose_override: None,
         }
     }
 
@@ -343,6 +347,7 @@ impl Engine {
             BotCommand { name: "agent".into(), description: "Switch agent backend".into() },
             BotCommand { name: "dir".into(), description: "Change work directory".into() },
             BotCommand { name: "attach".into(), description: "Bind channel to a tmux session".into() },
+            BotCommand { name: "verbose".into(), description: "Toggle showing tool progress + thinking".into() },
             BotCommand { name: "status".into(), description: "Show status".into() },
             BotCommand { name: "skills".into(), description: "List skills".into() },
             BotCommand { name: "cron".into(), description: "Scheduled tasks".into() },
@@ -852,6 +857,8 @@ async fn process_and_drain(
 
     let session_work_dir = sessions.get_work_dir(session_key);
     let session_tmux = sessions.get_tmux_session(session_key);
+    // Resolve the per-channel verbose override once for this turn.
+    let display = effective_display(config, interactive_states, session_key).await;
 
     // Get or create agent session + send the user message + take event rx.
     let rx = {
@@ -947,7 +954,7 @@ async fn process_and_drain(
     let (rx, result) = run_event_loop_and_save(
         platform, reply_ctx, rx, &mut perm_rx, &responder,
         &mut local_approve_all, &pending_flag, &stopped_flag, stop_typing,
-        &config.display, event_broadcast, sessions, session_key, inplace_progress,
+        &display, event_broadcast, sessions, session_key, inplace_progress,
     ).await;
 
     // If the event loop produced no real result (empty result + channel closed),
@@ -1033,7 +1040,7 @@ async fn process_and_drain(
                 let sf2 = Arc::new(AtomicBool::new(false));
                 let (rx2, _) = run_event_loop_and_save(
                     platform, reply_ctx, rx, &mut perm_rx2, &responder2,
-                    &mut aa2, &pf2, &sf2, retry_typing, &config.display, event_broadcast, sessions, session_key,
+                    &mut aa2, &pf2, &sf2, retry_typing, &display, event_broadcast, sessions, session_key,
                     inplace_progress,
                 ).await;
 
@@ -1336,10 +1343,11 @@ async fn drain_pending_messages(
         // Process event loop for this queued message
         let reply_ctx: &dyn ReplyCtx = queued.reply_ctx.as_ref();
         let inplace_progress = uses_inplace_tool_progress(active_agents, session_key, config).await;
+        let display = effective_display(config, interactive_states, session_key).await;
         let (rx, _result) = run_event_loop_and_save(
             platform, reply_ctx, rx, &mut perm_rx, &responder,
             &mut local_approve_all, &pending_flag, &stopped_flag, queued_stop_typing,
-            &config.display, event_broadcast, sessions, session_key, inplace_progress,
+            &display, event_broadcast, sessions, session_key, inplace_progress,
         ).await;
 
         // Store back approve_all and clear perm state
@@ -1671,6 +1679,42 @@ async fn handle_command_message(
         return Ok(true);
     }
 
+    // Handle /verbose command — per-channel toggle for the "show the work"
+    // switch (tool progress + thinking / inter-tool text). Quiet mode leaves
+    // only the final reply. `/verbose` with no arg toggles; `on`/`off` set it.
+    if cmd == "verbose" || cmd == "quiet" {
+        let arg = args.trim().to_lowercase();
+        // `/quiet` is sugar for `/verbose off`.
+        let target = if cmd == "quiet" {
+            Some(false)
+        } else {
+            match arg.as_str() {
+                "on" | "true" | "1" | "开" => Some(true),
+                "off" | "false" | "0" | "关" => Some(false),
+                "" => None, // toggle
+                _ => None,
+            }
+        };
+        let core_session = sessions.get_or_create(&session_key);
+        let new_val = {
+            let mut states = interactive_states.lock().await;
+            let state = states
+                .entry(session_key.clone())
+                .or_insert_with(|| EngineInteractiveState::new(core_session));
+            let current = state.verbose_override.unwrap_or(config.display.verbose);
+            let v = target.unwrap_or(!current);
+            state.verbose_override = Some(v);
+            v
+        };
+        let text = if new_val {
+            "🔊 详细模式开:会显示工具调用进度和思考过程"
+        } else {
+            "🤫 安静模式开:只发最终回复,过程不显示"
+        };
+        platform.reply(msg.reply_ctx.as_ref(), text).await?;
+        return Ok(true);
+    }
+
     // Handle /skills command (list available skills)
     if cmd == "skills" {
         let all_skills = skill_registry.list_all();
@@ -1770,6 +1814,22 @@ async fn start_agent_session_for_key(
         hook_route,
     )
     .await
+}
+
+/// Build the effective `DisplayConfig` for a turn: the project's `display`
+/// config with the per-channel `verbose` override (set by `/verbose`) applied.
+/// Returns an owned config so the event loop borrows a stable value.
+async fn effective_display(
+    config: &ProjectConfig,
+    interactive_states: &Mutex<HashMap<String, EngineInteractiveState>>,
+    session_key: &str,
+) -> crate::config::DisplayConfig {
+    let mut display = config.display.clone();
+    let states = interactive_states.lock().await;
+    if let Some(v) = states.get(session_key).and_then(|s| s.verbose_override) {
+        display.verbose = v;
+    }
+    display
 }
 
 /// Whether this session's active backend relays tool progress in place.

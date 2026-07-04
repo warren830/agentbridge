@@ -34,3 +34,6 @@ feishu-sdk = { version = "0.1.2", features = ["websocket"] }
 
 [dev-dependencies]
 tempfile = "3"
+# test-util enables tokio's paused virtual clock (start_paused / time::advance)
+# so timeout-behavior tests run instantly and deterministically.
+tokio = { version = "1", features = ["full", "test-util"] }

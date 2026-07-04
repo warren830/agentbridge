@@ -93,7 +93,17 @@ impl TelegramPlatform {
     /// Low-level Telegram Bot API call.
     async fn api_call(&self, method: &str, params: &serde_json::Value) -> Result<serde_json::Value> {
         let url = format!("https://api.telegram.org/bot{}/{}", self.token, method);
-        let resp = self.client.post(&url).json(params).send().await?;
+        // Per-request timeout: the shared client also long-polls getUpdates (which
+        // must stay unbounded), so we bound sends here, not client-wide. Without
+        // this, a stale keep-alive connection hangs the reply forever and strands
+        // the engine's per-session lock.
+        let resp = self
+            .client
+            .post(&url)
+            .json(params)
+            .timeout(std::time::Duration::from_secs(30))
+            .send()
+            .await?;
         let body: serde_json::Value = resp.json().await?;
         Ok(body)
     }
@@ -310,7 +320,12 @@ impl ImageSender for TelegramPlatform {
         }
 
         let url = format!("https://api.telegram.org/bot{}/sendPhoto", self.token);
-        self.client.post(&url).multipart(form).send().await?;
+        self.client
+            .post(&url)
+            .multipart(form)
+            .timeout(std::time::Duration::from_secs(60))
+            .send()
+            .await?;
 
         Ok(())
     }
@@ -406,7 +421,12 @@ impl TypingIndicator for TelegramPlatform {
                     "chat_id": chat_id,
                     "action": "typing",
                 });
-                let _ = client.post(&url).json(&params).send().await;
+                let _ = client
+                    .post(&url)
+                    .json(&params)
+                    .timeout(std::time::Duration::from_secs(15))
+                    .send()
+                    .await;
             }
         });
 
@@ -453,7 +473,16 @@ async fn poll_loop(
         });
 
         let url = format!("https://api.telegram.org/bot{}/getUpdates", token);
-        match client.post(&url).json(&params).send().await {
+        // Client-side cap ABOVE the 30s server-side long-poll hold: without it
+        // a half-open connection (NAT expiry without RST) pends forever and
+        // telegram goes silently dead until restart.
+        match client
+            .post(&url)
+            .json(&params)
+            .timeout(std::time::Duration::from_secs(50))
+            .send()
+            .await
+        {
             Ok(resp) => {
                 backoff_secs = 1; // reset on success
                 if let Ok(data) = resp.json::<serde_json::Value>().await {
@@ -634,10 +663,16 @@ async fn download_file(
     file_id: &str,
     client: &reqwest::Client,
 ) -> Result<(Vec<u8>, String)> {
-    // Step 1: resolve file_path via getFile.
+    // Step 1: resolve file_path via getFile. These downloads run inline in the
+    // poll loop, so an unbounded hang here stalls ALL telegram intake.
     let url = format!("https://api.telegram.org/bot{}/getFile", token);
     let params = serde_json::json!({ "file_id": file_id });
-    let resp = client.post(&url).json(&params).send().await?;
+    let resp = client
+        .post(&url)
+        .json(&params)
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await?;
     let body: serde_json::Value = resp.json().await?;
 
     let file_path = body["result"]["file_path"]
@@ -653,7 +688,14 @@ async fn download_file(
 
     // Step 2: download the actual bytes.
     let download_url = format!("https://api.telegram.org/file/bot{}/{}", token, file_path);
-    let data = client.get(&download_url).send().await?.bytes().await?.to_vec();
+    let data = client
+        .get(&download_url)
+        .timeout(std::time::Duration::from_secs(60))
+        .send()
+        .await?
+        .bytes()
+        .await?
+        .to_vec();
 
     Ok((data, filename))
 }
@@ -664,10 +706,15 @@ async fn download_voice_to_temp(
     file_id: &str,
     client: &reqwest::Client,
 ) -> Result<String> {
-    // Step 1: resolve file_path.
+    // Step 1: resolve file_path (bounded — runs inline in the poll loop).
     let url = format!("https://api.telegram.org/bot{}/getFile", token);
     let params = serde_json::json!({ "file_id": file_id });
-    let resp = client.post(&url).json(&params).send().await?;
+    let resp = client
+        .post(&url)
+        .json(&params)
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await?;
     let body: serde_json::Value = resp.json().await?;
 
     let file_path = body["result"]["file_path"]
@@ -676,7 +723,13 @@ async fn download_voice_to_temp(
 
     // Step 2: download bytes.
     let download_url = format!("https://api.telegram.org/file/bot{}/{}", token, file_path);
-    let file_bytes = client.get(&download_url).send().await?.bytes().await?;
+    let file_bytes = client
+        .get(&download_url)
+        .timeout(std::time::Duration::from_secs(60))
+        .send()
+        .await?
+        .bytes()
+        .await?;
 
     // Step 3: write to temp file.
     let temp_dir = std::env::temp_dir().join("agentbridge_voice");

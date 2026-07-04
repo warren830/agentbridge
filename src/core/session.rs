@@ -360,14 +360,18 @@ impl SessionManager {
     /// per-key state (e.g. last-used agent) after a restart without
     /// accidentally resurrecting historical sessions.
     pub fn active_sessions(&self) -> Vec<(String, Arc<Session>)> {
-        let active = self.active_keys.lock().unwrap();
+        // Never hold `active_keys` and `sessions` together: persist() acquires
+        // them in the opposite order, which deadlocked (AB-BA) under load.
+        // Snapshot the pairs first, then resolve.
+        let pairs: Vec<(String, String)> = {
+            let active = self.active_keys.lock().unwrap();
+            active.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        };
         let sessions = self.sessions.lock().unwrap();
-        active
-            .iter()
+        pairs
+            .into_iter()
             .filter_map(|(key, session_id)| {
-                sessions
-                    .get(session_id)
-                    .map(|s| (key.clone(), Arc::clone(s)))
+                sessions.get(&session_id).map(|s| (key, Arc::clone(s)))
             })
             .collect()
     }
@@ -511,20 +515,27 @@ impl SessionManager {
         }
     }
 
+    /// Resolve a key's active session id WITHOUT holding the lock afterwards.
+    /// All getters go through this so no code path ever holds `active_keys`
+    /// while acquiring `sessions` — the reverse of persist()'s order, which
+    /// deadlocked (AB-BA) when a turn's start raced another turn's end.
+    fn active_session_id(&self, key: &str) -> Option<String> {
+        let active = self.active_keys.lock().unwrap();
+        active.get(key).cloned()
+    }
+
     /// Get the work directory for the active session of a key.
     pub fn get_work_dir(&self, key: &str) -> Option<String> {
-        let active = self.active_keys.lock().unwrap();
-        let session_id = active.get(key)?;
+        let session_id = self.active_session_id(key)?;
         let sessions = self.sessions.lock().unwrap();
-        sessions.get(session_id)?.work_dir.clone()
+        sessions.get(&session_id)?.work_dir.clone()
     }
 
     /// Get the explicit tmux session name bound to a key (via `/attach`).
     pub fn get_tmux_session(&self, key: &str) -> Option<String> {
-        let active = self.active_keys.lock().unwrap();
-        let session_id = active.get(key)?;
+        let session_id = self.active_session_id(key)?;
         let sessions = self.sessions.lock().unwrap();
-        sessions.get(session_id)?.tmux_session.clone()
+        sessions.get(&session_id)?.tmux_session.clone()
     }
 
     /// Bind a key to an explicit tmux session name (via `/attach`). Ensures a
@@ -584,10 +595,9 @@ impl SessionManager {
 
     /// Get the agent session ID for the active session of a key.
     pub fn get_agent_session_id(&self, key: &str) -> Option<String> {
-        let active = self.active_keys.lock().unwrap();
-        let session_id = active.get(key)?;
+        let session_id = self.active_session_id(key)?;
         let sessions = self.sessions.lock().unwrap();
-        sessions.get(session_id)?.agent_session_id.clone()
+        sessions.get(&session_id)?.agent_session_id.clone()
     }
 
     /// Set the agent session ID for the active session of a key (for resume).
@@ -633,27 +643,33 @@ impl SessionManager {
     /// the agent to fork a random CLI session on every restart.
     /// (The __continue__ sentinel is stripped before persisting.)
     pub fn persist(&self) {
-        let sessions = self.sessions.lock().unwrap();
-        let active_keys = self.active_keys.lock().unwrap();
-        let session_keys = self.session_keys.lock().unwrap();
+        // Snapshot under the locks (global order: sessions → active_keys →
+        // session_keys — no other path acquires these in a conflicting order),
+        // then serialize + write to disk AFTER all guards are dropped, so a
+        // slow disk never extends the critical section.
+        let state = {
+            let sessions = self.sessions.lock().unwrap();
+            let active_keys = self.active_keys.lock().unwrap();
+            let session_keys = self.session_keys.lock().unwrap();
 
-        let mut data_sessions = HashMap::new();
-        for (id, session) in sessions.iter() {
-            let key = session_keys
-                .get(id)
-                .cloned()
-                .unwrap_or_default();
-            let mut sd = SessionData::from_session(session, &key);
-            // Strip __continue__ sentinel before persisting
-            if sd.agent_session_id.as_deref() == Some("__continue__") {
-                sd.agent_session_id = None;
+            let mut data_sessions = HashMap::new();
+            for (id, session) in sessions.iter() {
+                let key = session_keys
+                    .get(id)
+                    .cloned()
+                    .unwrap_or_default();
+                let mut sd = SessionData::from_session(session, &key);
+                // Strip __continue__ sentinel before persisting
+                if sd.agent_session_id.as_deref() == Some("__continue__") {
+                    sd.agent_session_id = None;
+                }
+                data_sessions.insert(id.clone(), sd);
             }
-            data_sessions.insert(id.clone(), sd);
-        }
 
-        let state = PersistedState {
-            sessions: data_sessions,
-            active_keys: active_keys.clone(),
+            PersistedState {
+                sessions: data_sessions,
+                active_keys: active_keys.clone(),
+            }
         };
 
         let path = self.data_dir.join("state.json");
@@ -1081,6 +1097,46 @@ mod tests {
         assert_eq!(active[0].1.id, latest.id);
         assert_eq!(active[0].1.agent_type, "kiro");
         assert_eq!(active[1].0, "user:bob");
+    }
+
+    #[test]
+    fn no_deadlock_between_getters_and_persist() {
+        // AB-BA regression: get_work_dir/get_tmux_session/get_agent_session_id
+        // held `active_keys` while acquiring `sessions`, while persist() held
+        // `sessions` while acquiring `active_keys`. The getters run at the
+        // start of every turn and persist() at the end, so two concurrent
+        // sessions could deadlock the whole bridge. Hammer both from two
+        // threads; a watchdog fails the test if they don't finish.
+        let tmp = TempDir::new().unwrap();
+        let mgr = Arc::new(SessionManager::new(tmp.path(), Path::new("/test/deadlock")));
+        mgr.new_session("user:dl", None);
+        mgr.set_work_dir("user:dl", "/tmp/dl");
+
+        let m1 = Arc::clone(&mgr);
+        let getters = std::thread::spawn(move || {
+            for _ in 0..3000 {
+                let _ = m1.get_work_dir("user:dl");
+                let _ = m1.get_tmux_session("user:dl");
+                let _ = m1.get_agent_session_id("user:dl");
+                let _ = m1.active_sessions();
+            }
+        });
+        let m2 = Arc::clone(&mgr);
+        let persister = std::thread::spawn(move || {
+            for _ in 0..3000 {
+                m2.persist();
+            }
+        });
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            getters.join().unwrap();
+            persister.join().unwrap();
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect("deadlock: getters vs persist did not finish within 15s");
     }
 
     #[test]

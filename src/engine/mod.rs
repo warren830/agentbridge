@@ -618,7 +618,10 @@ async fn handle_message(
 
     // Ensure interactive state exists (creates session via SessionManager
     // if needed, but then stores and reuses the SAME Arc<Session>).
-    let session = {
+    // `mut` because the idle auto-reset below swaps in a fresh session and
+    // MUST rebind this binding — a scoped shadow here once left the new
+    // session locked forever (permanent per-channel wedge).
+    let mut session = {
         let mut states = interactive_states.lock().await;
         let state = states
             .entry(session_key.clone())
@@ -744,17 +747,21 @@ async fn handle_message(
             session.unlock();
             cleanup_agent_session(config, sessions, interactive_states, hook_route, &session_key).await;
             if !new_s.try_lock_explicit() {
-                return Ok(()); // shouldn't happen, but be safe
+                tracing::error!(session_key = %session_key, "idle reset: fresh session unexpectedly busy, dropping message");
+                return Ok(());
             }
-            // Update session reference for process_and_drain
-            let session = {
+            // Rebind the OUTER binding so process_and_drain (and its unlock
+            // paths) operate on the session that actually holds the lock. A
+            // block-scoped `let session = ...` here previously shadowed and
+            // died immediately — the new session stayed locked forever and the
+            // channel wedged permanently.
+            session = {
                 let mut states = interactive_states.lock().await;
                 let state = states
                     .entry(session_key.clone())
                     .or_insert_with(|| EngineInteractiveState::new(Arc::clone(&new_s)));
                 Arc::clone(&state.session)
             };
-            let _ = session; // rebind
         }
     }
 
@@ -1093,16 +1100,30 @@ async fn process_and_drain(
                     threshold = config.auto_compress.max_tokens,
                     "auto-compress: token threshold exceeded, sending /compact"
                 );
-                let mut states = interactive_states.lock().await;
-                if let Some(state) = states.get_mut(session_key) {
-                    if let Some(ref mut cs) = state.agent_session {
-                        if cs.alive() {
-                            // Send /compact and drain the resulting events
-                            // (otherwise they pile up as stale events)
-                            let _ = cs.send("/compact").await;
-                            cs.drain_stale_events();
-                            // Wait a bit for the compress to produce events, then drain again
-                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                // Send /compact under a SHORT lock, then sleep with the lock
+                // RELEASED: interactive_states is the global state map, and
+                // holding it across the 2s settle sleep froze message intake
+                // for every session on the bridge.
+                let sent = {
+                    let mut states = interactive_states.lock().await;
+                    if let Some(state) = states.get_mut(session_key) {
+                        if let Some(ref mut cs) = state.agent_session {
+                            if cs.alive() {
+                                // Send /compact and drain the resulting events
+                                // (otherwise they pile up as stale events)
+                                let _ = cs.send("/compact").await;
+                                cs.drain_stale_events();
+                                true
+                            } else { false }
+                        } else { false }
+                    } else { false }
+                };
+                if sent {
+                    // Wait for the compress to produce events, then drain again.
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    let mut states = interactive_states.lock().await;
+                    if let Some(state) = states.get_mut(session_key) {
+                        if let Some(ref mut cs) = state.agent_session {
                             cs.drain_stale_events();
                         }
                     }
@@ -1629,20 +1650,30 @@ async fn handle_command_message(
 
     // Handle /compress — send /compact to the running agent
     if cmd == "compress" || cmd == "compact" {
+        // Same shape as auto-compress: never hold the global state lock
+        // across the 2s settle sleep (it gates message intake bridge-wide).
         let sent = {
             let mut states = interactive_states.lock().await;
             if let Some(state) = states.get_mut(&session_key) {
                 if let Some(ref mut cs) = state.agent_session {
                     if cs.alive() {
                         let _ = cs.send("/compact").await;
-                        // Drain the resulting events
-                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                        cs.drain_stale_events();
                         true
                     } else { false }
                 } else { false }
             } else { false }
         };
+        if sent {
+            // Drain the resulting events after they settle, lock released
+            // during the wait.
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            let mut states = interactive_states.lock().await;
+            if let Some(state) = states.get_mut(&session_key) {
+                if let Some(ref mut cs) = state.agent_session {
+                    cs.drain_stale_events();
+                }
+            }
+        }
         let msg_text = if sent {
             "🗜️ 上下文压缩已触发"
         } else {

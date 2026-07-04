@@ -114,7 +114,12 @@ pub async fn transcribe(config: &SpeechConfig, audio_path: &Path) -> Result<Stri
     let base_url = config.resolve_base_url();
     let url = format!("{}/audio/transcriptions", base_url);
 
-    let client = reqwest::Client::new();
+    // Bounded: this runs on the per-voice-message path; reqwest's default has
+    // NO timeout, so a stalled STT endpoint would hang the message forever.
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .build()?;
 
     let file_bytes = tokio::fs::read(audio_path).await?;
     let file_name = audio_path
@@ -165,7 +170,10 @@ pub async fn synthesize(config: &SpeechConfig, text: &str) -> Result<std::path::
     };
 
     let url = format!("{}/audio/speech", base_url);
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .build()?;
 
     let body = serde_json::json!({
         "model": config.tts_model(),

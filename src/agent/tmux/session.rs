@@ -486,26 +486,31 @@ async fn poll_loop(
             had_content = true;
             saw_busy_since_emit = true;
             busy_ticks += 1;
-            if busy_ticks >= HEARTBEAT_TICKS && should_emit_heartbeat(hook_relay) {
-                // The Thinking heartbeat is rendered as a visible `🧠 Working…`
-                // message and detaches the live preview, so it must not fire in
-                // hook mode (BR-14). Suppressing it leaves the engine idle
-                // timeout unreset on a long Stop-only turn.
-                // TODO(batch): silent keepalive for >300s turns — emit a
-                // non-rendered liveness signal (or raise the hook-mode idle
-                // timeout) so a long turn does not trip the 300s break.
+            if busy_ticks >= HEARTBEAT_TICKS {
                 busy_ticks = 0;
-                let status = current_lines
-                    .iter()
-                    .rev()
-                    .map(|l| l.trim())
-                    .find(|l| is_done_footer(l))
-                    .unwrap_or("Working…")
-                    .to_string();
-                // Only send if it changed, to avoid identical repeats.
-                if status != last_heartbeat {
-                    last_heartbeat = status.clone();
-                    let _ = tx.send(AgentEvent::Thinking { content: status }).await;
+                if should_emit_heartbeat(hook_relay) {
+                    // Scrape mode: visible `🧠 Working…` heartbeat with the live
+                    // status line, so long tasks show progress in the chat.
+                    let status = current_lines
+                        .iter()
+                        .rev()
+                        .map(|l| l.trim())
+                        .find(|l| is_done_footer(l))
+                        .unwrap_or("Working…")
+                        .to_string();
+                    // Only send if it changed, to avoid identical repeats.
+                    if status != last_heartbeat {
+                        last_heartbeat = status.clone();
+                        let _ = tx.send(AgentEvent::Thinking { content: status }).await;
+                    }
+                } else {
+                    // Hook mode: the visible heartbeat is suppressed (it would
+                    // render as a message and detach the preview, BR-14), so a
+                    // long quiet turn used to trip the engine's idle timeout —
+                    // the turn was aborted ("等太久了") and the eventual Stop
+                    // hook answer discarded as stale. Emit a SILENT keepalive
+                    // instead: resets the idle timer, renders nothing.
+                    let _ = tx.send(AgentEvent::Keepalive).await;
                 }
             }
             continue;
@@ -544,6 +549,20 @@ async fn poll_loop(
             let safety_net = idle
                 && saw_busy_since_emit
                 && stable_ticks >= STABLE_TICKS + HOOK_SAFETY_NET_TICKS;
+            // Diagnostic: while a turn is pending completion (it went busy and no
+            // Result has fired yet), log the settle state each tick. If the Stop
+            // hook is lost, this trace shows whether the safety-net is converging
+            // (stable_ticks climbing to the threshold) or stuck (idle never true,
+            // or stable_ticks resetting because the screen keeps changing).
+            if saw_busy_since_emit {
+                tracing::debug!(
+                    busy,
+                    idle,
+                    stable_ticks,
+                    safety_net,
+                    "tmux hook: awaiting turn completion"
+                );
+            }
             if safety_net {
                 tracing::debug!("tmux hook mode: settle safety-net Result (no Stop hook seen)");
                 let _ = tx
@@ -672,11 +691,41 @@ async fn wait_for_claude_ready(session_name: &str) {
     }
 }
 
+/// Run a subprocess with a hard timeout, killing the child if it overruns.
+///
+/// tmux calls sit on the engine's turn path, which holds the per-session lock
+/// and only releases it when the turn returns. An unbounded `.output().await`
+/// against a wedged tmux server never returns, so the lock is stranded `busy`
+/// and every later message hangs until the process is restarted. Bounding the
+/// call turns that permanent hang into a recoverable per-turn error.
+async fn output_bounded(
+    cmd: &mut Command,
+    timeout: std::time::Duration,
+    what: &str,
+) -> Result<std::process::Output> {
+    // Kill the child on drop so a timed-out (hung) tmux client is reaped rather
+    // than left orphaned.
+    cmd.kill_on_drop(true);
+    match tokio::time::timeout(timeout, cmd.output()).await {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(e)) => Err(anyhow!("{what}: spawn failed: {e}")),
+        Err(_) => Err(anyhow!("{what}: timed out after {timeout:?}")),
+    }
+}
+
+/// Hard timeout for every tmux CLI call on the turn/poll path.
+const TMUX_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Run a `tmux` subcommand with the standard bounded timeout.
+async fn run_tmux(args: &[&str], what: &str) -> Result<std::process::Output> {
+    let mut cmd = Command::new("tmux");
+    cmd.args(args);
+    output_bounded(&mut cmd, TMUX_TIMEOUT, what).await
+}
+
 /// Check if a tmux session exists.
 async fn tmux_has_session(session_name: &str) -> bool {
-    Command::new("tmux")
-        .args(["has-session", "-t", session_name])
-        .output()
+    run_tmux(&["has-session", "-t", session_name], "tmux has-session")
         .await
         .map(|o| o.status.success())
         .unwrap_or(false)
@@ -687,10 +736,11 @@ async fn tmux_has_session(session_name: &str) -> bool {
 /// typed verbatim (no shell is involved).
 async fn tmux_send_keys(session_name: &str, text: &str) -> Result<()> {
     let escaped = escape_for_tmux(text);
-    let output = Command::new("tmux")
-        .args(["send-keys", "-t", session_name, "--", &escaped, "Enter"])
-        .output()
-        .await?;
+    let output = run_tmux(
+        &["send-keys", "-t", session_name, "--", escaped.as_str(), "Enter"],
+        "tmux send-keys",
+    )
+    .await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(anyhow!("tmux send-keys failed: {}", stderr.trim()));
@@ -700,10 +750,11 @@ async fn tmux_send_keys(session_name: &str, text: &str) -> Result<()> {
 
 /// Send raw keys (like "1", "3", "C-c") followed by Enter.
 async fn tmux_send_raw_keys(session_name: &str, keys: &str) -> Result<()> {
-    let output = Command::new("tmux")
-        .args(["send-keys", "-t", session_name, keys, "Enter"])
-        .output()
-        .await?;
+    let output = run_tmux(
+        &["send-keys", "-t", session_name, keys, "Enter"],
+        "tmux send-keys",
+    )
+    .await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(anyhow!("tmux send-keys failed: {}", stderr.trim()));
@@ -715,10 +766,7 @@ async fn tmux_send_raw_keys(session_name: &str, keys: &str) -> Result<()> {
 /// Used for control keys like interrupt, where appending Enter would submit a
 /// stray empty line into the prompt.
 async fn tmux_send_key_raw(session_name: &str, key: &str) -> Result<()> {
-    let output = Command::new("tmux")
-        .args(["send-keys", "-t", session_name, key])
-        .output()
-        .await?;
+    let output = run_tmux(&["send-keys", "-t", session_name, key], "tmux send-keys").await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(anyhow!("tmux send-keys failed: {}", stderr.trim()));
@@ -737,10 +785,11 @@ async fn tmux_send_permission(session_name: &str, allow: bool) -> Result<()> {
 
 /// Capture the last 100 lines from the tmux pane.
 async fn tmux_capture_pane(session_name: &str) -> Result<Vec<String>> {
-    let output = Command::new("tmux")
-        .args(["capture-pane", "-t", session_name, "-p", "-S", "-100"])
-        .output()
-        .await?;
+    let output = run_tmux(
+        &["capture-pane", "-t", session_name, "-p", "-S", "-100"],
+        "tmux capture-pane",
+    )
+    .await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(anyhow!("tmux capture-pane failed: {}", stderr.trim()));
@@ -1053,6 +1102,37 @@ mod tests {
         // emits only an empty safety-net Result); scrape mode keeps the heartbeat.
         assert!(!should_emit_heartbeat(true));
         assert!(should_emit_heartbeat(false));
+    }
+
+    #[tokio::test]
+    async fn output_bounded_errs_when_child_exceeds_timeout() {
+        // tmux subprocess calls sit on the turn's lock-holding path. If tmux
+        // wedges, an unbounded `.output().await` never returns, so the session
+        // lock is stranded `busy` and every later message hangs until restart.
+        // output_bounded must surface an Err on timeout rather than park.
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+        let start = std::time::Instant::now();
+        let result =
+            output_bounded(&mut cmd, std::time::Duration::from_millis(100), "sleep-test").await;
+        assert!(
+            result.is_err(),
+            "a child exceeding the timeout must return Err, not hang"
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "output_bounded must return promptly on timeout, not wait for the child"
+        );
+    }
+
+    #[tokio::test]
+    async fn output_bounded_returns_output_when_child_completes() {
+        // The happy path must still yield the child's output unchanged.
+        let mut cmd = Command::new("true");
+        let out = output_bounded(&mut cmd, std::time::Duration::from_secs(5), "true-test")
+            .await
+            .expect("a fast child within the timeout must return Ok");
+        assert!(out.status.success());
     }
 
     // A real AskUserQuestion chooser captured from the cc TUI (the one that

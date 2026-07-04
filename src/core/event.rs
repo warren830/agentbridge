@@ -69,6 +69,13 @@ pub enum AgentEvent {
         options: Vec<PermissionOption>,
     },
 
+    /// Silent liveness signal: resets the engine's idle timeout without
+    /// producing ANY chat output. Emitted by the tmux poll loop in hook mode
+    /// during long busy stretches, where the visible `Thinking` heartbeat is
+    /// suppressed — without this, a quiet turn longer than the idle timeout
+    /// was aborted ("等太久了") and its eventual Stop-hook answer discarded.
+    Keepalive,
+
     /// Final result of the session.
     Result {
         content: String,

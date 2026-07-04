@@ -130,13 +130,15 @@ pub async fn process_agent_events(
             }
         };
 
-        // Broadcast event for gateway forwarding
+        // Broadcast event for gateway forwarding. No receivers is the normal
+        // case (no gateway attached) — keep this at trace to avoid one log
+        // line per agent event over a days-long run.
         match event_broadcast.send((session_key_for_broadcast.to_string(), event.clone())) {
             Ok(n) => {
-                tracing::info!(receivers = n, "event broadcast sent");
+                tracing::trace!(receivers = n, "event broadcast sent");
             }
             Err(_) => {
-                tracing::warn!("event broadcast: no receivers");
+                tracing::trace!("event broadcast: no receivers");
             }
         }
 
@@ -395,12 +397,24 @@ pub async fn process_agent_events(
                         let _ = platform.reply(ctx, "💤 权限确认超时，已自动拦截").await;
                     }
                 }
+
+                // The wait above can consume minutes of wall time with no agent
+                // events; the agent only STARTS working after the decision.
+                // Refresh the idle deadline so that waiting time doesn't count
+                // against it — otherwise a slow approval tripped the idle
+                // timeout on the very next poll tick and the turn's eventual
+                // answer was discarded.
+                idle_deadline = tokio::time::Instant::now() + EVENT_IDLE_TIMEOUT;
             }
 
             // ----- System handshake -----
             AgentEvent::System { session_id, .. } => {
                 tracing::debug!(session_id = %session_id, "agent system handshake");
             }
+
+            // ----- Silent liveness -----
+            // Receipt already reset idle_deadline above; produce no output.
+            AgentEvent::Keepalive => {}
 
             // ----- Final result -----
             AgentEvent::Result {
@@ -958,6 +972,104 @@ mod tests {
 
         let out = rec.lock().unwrap().clone();
         out
+    }
+
+    #[tokio::test]
+    async fn keepalive_is_invisible_and_does_not_end_turn() {
+        // Hook mode suppresses the visible heartbeat, so long busy stretches
+        // send Keepalive instead: it must reset the idle timer (implicit in
+        // being received) while producing NO chat output and NOT ending the
+        // turn — the turn ends only on the real Result.
+        let rec = drive(
+            vec![
+                AgentEvent::Keepalive,
+                AgentEvent::Keepalive,
+                result_ev("最终答案"),
+            ],
+            true,
+        )
+        .await;
+
+        // The only visible output is the final answer.
+        assert!(
+            rec.iter().any(|r| matches!(r, Rec::Reply(c) if c.contains("最终答案"))),
+            "final answer must be replied: {rec:?}"
+        );
+        assert_eq!(
+            rec.len(),
+            1,
+            "keepalives must produce no chat output at all: {rec:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn permission_wait_refreshes_idle_deadline() {
+        // Regression: the permission wait blocks up to 600s, but idle_deadline
+        // was only refreshed on event receipt — a user approving after >300s
+        // made the very next poll tick trip the idle timeout and abort the
+        // turn ("等太久了") even though the agent was actively working.
+        let tp = Arc::new(TestPlatform::new());
+        let rec = Arc::clone(&tp.rec);
+        let platform: Arc<dyn PlatformCapabilities> = tp;
+
+        let (tx, rx) = mpsc::channel::<AgentEvent>(8);
+        let (perm_tx, perm_rx) = mpsc::channel::<PermissionDecision>(1);
+        let (btx, _brx) = broadcast::channel(8);
+        let btx = Arc::new(btx);
+
+        let jh = tokio::spawn({
+            let platform = Arc::clone(&platform);
+            async move {
+                let mut rx = rx;
+                let mut perm_rx = perm_rx;
+                let responder: Arc<dyn PermissionResponder> = Arc::new(NoopResponder);
+                let mut approve_all = false;
+                let pending = Arc::new(AtomicBool::new(false));
+                let stopped = Arc::new(AtomicBool::new(false));
+                let display = DisplayConfig::default();
+                process_agent_events(
+                    &platform, &TestCtx, &mut rx, &mut perm_rx, &responder,
+                    &mut approve_all, &pending, &stopped, None, &display, &btx,
+                    "test:session", true,
+                )
+                .await
+            }
+        });
+
+        // Agent asks for permission; the loop blocks on the decision.
+        tx.send(AgentEvent::PermissionRequest {
+            request_id: "r1".to_string(),
+            tool: "Bash".to_string(),
+            input: serde_json::json!({}),
+            options: vec![],
+        })
+        .await
+        .unwrap();
+        tokio::task::yield_now().await;
+
+        // User takes 5.5 virtual minutes to decide (past the 300s idle budget,
+        // within the 600s permission window).
+        tokio::time::advance(std::time::Duration::from_secs(330)).await;
+        perm_tx.send(PermissionDecision::Allow).await.unwrap();
+
+        // Give the loop a few poll ticks, then deliver the real result. Under
+        // the bug the loop has already aborted (rx dropped) — send tolerantly
+        // and let the session_id assertion below do the judging.
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        let _ = tx.send(result_ev("批准后的答案")).await;
+
+        let result = jh.await.unwrap().expect("event loop ok");
+        assert_eq!(
+            result.session_id.as_deref(),
+            Some("s1"),
+            "the real Result must be consumed after a slow permission approval"
+        );
+        assert!(
+            !rec.lock().unwrap().iter().any(
+                |r| matches!(r, Rec::Reply(c) if c.contains("等太久了"))
+            ),
+            "no spurious idle-timeout abort after a slow approval"
+        );
     }
 
     #[tokio::test]

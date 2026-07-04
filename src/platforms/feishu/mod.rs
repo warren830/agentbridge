@@ -116,14 +116,18 @@ impl FeishuPlatform {
             "msg_type": "interactive",
             "content": build_card(markdown).to_string(),
         });
-        let resp = self
+        let req = self
             .client
             .operation("im.v1.message.create")
             .query_param("receive_id_type", "chat_id")
             .body_json(&body)
-            .map_err(|e| anyhow!("feishu body: {e:?}"))?
-            .send()
+            .map_err(|e| anyhow!("feishu body: {e:?}"))?;
+        // Bound the SDK send: it runs on the engine's turn path, which holds the
+        // per-session lock until the turn returns. An unbounded hang here strands
+        // the lock and wedges the channel until restart.
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(30), req.send())
             .await
+            .map_err(|_| anyhow!("feishu send: timed out after 30s"))?
             .map_err(|e| anyhow!("feishu send: {e:?}"))?;
         // Feishu returns HTTP 200 even on app-level failures (non-zero `code`
         // in the body), so the response body is the real signal — log it.
@@ -145,14 +149,15 @@ impl FeishuPlatform {
     /// message — the Feishu equivalent of a typing indicator.
     async fn add_reaction(&self, message_id: &str, emoji_type: &str) -> Result<String> {
         let body = serde_json::json!({ "reaction_type": { "emoji_type": emoji_type } });
-        let resp = self
+        let req = self
             .client
             .operation("im.v1.message_reaction.create")
             .path_param("message_id", message_id)
             .body_json(&body)
-            .map_err(|e| anyhow!("feishu reaction body: {e:?}"))?
-            .send()
+            .map_err(|e| anyhow!("feishu reaction body: {e:?}"))?;
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(15), req.send())
             .await
+            .map_err(|_| anyhow!("feishu reaction: timed out after 15s"))?
             .map_err(|e| anyhow!("feishu reaction: {e:?}"))?;
         serde_json::from_slice::<serde_json::Value>(&resp.body)
             .ok()
@@ -183,33 +188,81 @@ impl Platform for FeishuPlatform {
             .clone()
             .ok_or_else(|| anyhow!("feishu: self_ref not set"))?;
 
-        let dispatcher = EventDispatcher::new(EventDispatcherConfig::new(), noop_logger());
-        dispatcher
-            .register_handler(Box::new(MessageReceiveHandler {
-                handler,
-                self_weak,
-                allow_from: self.allow_from.clone(),
-                group_reply_all: self.group_reply_all,
-            }))
-            .await;
+        // Builds a fresh stream client (dispatcher included — the SDK consumes
+        // it per stream, so every reconnect needs a new one).
+        let app_id = self.app_id.clone();
+        let app_secret = self.app_secret.clone();
+        let base_url = self.base_url.clone();
+        let allow_from = self.allow_from.clone();
+        let group_reply_all = self.group_reply_all;
+        let build_stream = move |handler: MessageHandler,
+                                 self_weak: std::sync::Weak<dyn PlatformCapabilities>| {
+            let app_id = app_id.clone();
+            let app_secret = app_secret.clone();
+            let base_url = base_url.clone();
+            let allow_from = allow_from.clone();
+            async move {
+                let dispatcher =
+                    EventDispatcher::new(EventDispatcherConfig::new(), noop_logger());
+                dispatcher
+                    .register_handler(Box::new(MessageReceiveHandler {
+                        handler,
+                        self_weak,
+                        allow_from,
+                        group_reply_all,
+                    }))
+                    .await;
+                let config = Config::builder(&app_id, &app_secret)
+                    .base_url(&base_url)
+                    .build();
+                StreamClient::builder(config)
+                    .event_dispatcher(dispatcher)
+                    .build()
+                    .map_err(|e| anyhow!("feishu stream build: {e:?}"))
+            }
+        };
 
-        let config = Config::builder(&self.app_id, &self.app_secret)
-            .base_url(&self.base_url)
-            .build();
-        let stream = StreamClient::builder(config)
-            .event_dispatcher(dispatcher)
-            .build()
-            .map_err(|e| anyhow!("feishu stream build: {e:?}"))?;
+        // First build happens before spawning so a bad config still fails
+        // start() loudly at startup.
+        let first = build_stream(handler.clone(), self_weak.clone()).await?;
 
         let app_id = self.app_id.clone();
-        tracing::info!(app_id = %app_id, "feishu: starting long-connection");
-        // `stream.start()` blocks (internal auto-reconnect) until the process
-        // ends. The engine's start loop must NOT block here — it still has to
-        // register commands, start cron, and start other platforms — so the
-        // long-connection runs on its own task, mirroring Discord's gateway loop.
+        // `stream.start()` blocks (internal auto-reconnect) until it gives up.
+        // The engine's start loop must NOT block here, so the long-connection
+        // runs on its own task — and unlike before, in a RECONNECT LOOP: if
+        // the SDK's internal reconnect ever gives up (auth blip, fatal WS
+        // error), we rebuild the stream with backoff instead of leaving the
+        // platform silently dead until process restart.
         tokio::spawn(async move {
-            if let Err(e) = stream.start().await {
-                tracing::error!(app_id = %app_id, error = ?e, "feishu long-connection ended");
+            let mut stream = Some(first);
+            let mut backoff_secs: u64 = 5;
+            loop {
+                let s = match stream.take() {
+                    Some(s) => s,
+                    None => match build_stream(handler.clone(), self_weak.clone()).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::error!(app_id = %app_id, error = %e, backoff_secs, "feishu: stream rebuild failed, retrying");
+                            tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+                            backoff_secs = (backoff_secs * 2).min(60);
+                            continue;
+                        }
+                    },
+                };
+                tracing::info!(app_id = %app_id, "feishu: starting long-connection");
+                let started = tokio::time::Instant::now();
+                match s.start().await {
+                    Ok(()) => tracing::warn!(app_id = %app_id, "feishu long-connection ended"),
+                    Err(e) => tracing::error!(app_id = %app_id, error = ?e, "feishu long-connection ended with error"),
+                }
+                // A connection that survived a while was healthy — reset the
+                // backoff so a one-off drop reconnects quickly.
+                if started.elapsed() > std::time::Duration::from_secs(60) {
+                    backoff_secs = 5;
+                }
+                tracing::warn!(app_id = %app_id, backoff_secs, "feishu: reconnecting long-connection");
+                tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+                backoff_secs = (backoff_secs * 2).min(60);
             }
         });
         Ok(())
@@ -263,14 +316,19 @@ impl MessageUpdater for FeishuPlatform {
         let body = serde_json::json!({
             "content": build_card(text).to_string(),
         });
-        let resp = self
+        let req = self
             .client
             .operation("im.v1.message.patch")
             .path_param("message_id", &h.message_id)
             .body_json(&body)
-            .map_err(|e| anyhow!("feishu patch body: {e:?}"))?
-            .send()
+            .map_err(|e| anyhow!("feishu patch body: {e:?}"))?;
+        // Bounded like send_card: preview edits fire constantly during
+        // streaming and run on the engine's lock-holding turn path — the SDK
+        // has NO default timeout, so an unbounded hang here strands the
+        // session lock.
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(30), req.send())
             .await
+            .map_err(|_| anyhow!("feishu patch: timed out after 30s"))?
             .map_err(|e| anyhow!("feishu patch: {e:?}"))?;
         // Surface app-level failures (HTTP 200 + non-zero code).
         let body_str = String::from_utf8_lossy(&resp.body);
@@ -285,11 +343,13 @@ impl MessageUpdater for FeishuPlatform {
             .as_any()
             .downcast_ref::<FeishuPreviewHandle>()
             .ok_or_else(|| anyhow!("feishu: wrong preview handle type"))?;
-        self.client
+        let req = self
+            .client
             .operation("im.v1.message.delete")
-            .path_param("message_id", &h.message_id)
-            .send()
+            .path_param("message_id", &h.message_id);
+        tokio::time::timeout(std::time::Duration::from_secs(15), req.send())
             .await
+            .map_err(|_| anyhow!("feishu delete: timed out after 15s"))?
             .map_err(|e| anyhow!("feishu delete: {e:?}"))?;
         Ok(())
     }
@@ -316,14 +376,19 @@ impl TypingIndicator for FeishuPlatform {
         let client = self.client.clone();
         Ok(Box::new(move || {
             tokio::spawn(async move {
-                let r = client
+                let req = client
                     .operation("im.v1.message_reaction.delete")
                     .path_param("message_id", &message_id)
-                    .path_param("reaction_id", &reaction_id)
-                    .send()
-                    .await;
-                if let Err(e) = r {
-                    tracing::warn!(error = %e, "feishu: failed to remove working reaction");
+                    .path_param("reaction_id", &reaction_id);
+                // Bounded so a hung connection doesn't leak this task forever.
+                match tokio::time::timeout(std::time::Duration::from_secs(15), req.send()).await {
+                    Ok(Err(e)) => {
+                        tracing::warn!(error = %e, "feishu: failed to remove working reaction");
+                    }
+                    Err(_) => {
+                        tracing::warn!("feishu: reaction removal timed out after 15s");
+                    }
+                    Ok(Ok(_)) => {}
                 }
             });
         }))

@@ -113,7 +113,15 @@ impl DiscordPlatform {
         Self {
             token: opts.token,
             allow_from,
-            client: reqwest::Client::new(),
+            // Discord receives over the gateway WebSocket, so this REST client is
+            // send-only — a client-wide timeout is safe and prevents a stale
+            // keep-alive connection from hanging a reply forever (which would
+            // strand the engine's per-session lock).
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .connect_timeout(Duration::from_secs(10))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
             running: Arc::new(AtomicBool::new(false)),
             bot_user_id: Arc::new(Mutex::new(None)),
             guild_id: opts.guild_id,

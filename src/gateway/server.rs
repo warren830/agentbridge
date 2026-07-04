@@ -307,7 +307,19 @@ async fn frontend_connection(socket: WebSocket, state: Arc<GatewayState>) {
     // For V1, forward ALL events to all authenticated frontends.
 
     let forward_handle = tokio::spawn(async move {
-        while let Ok(msg) = broadcast_rx.recv().await {
+        loop {
+            let msg = match broadcast_rx.recv().await {
+                Ok(m) => m,
+                // Lagged just means a streaming burst outran this frontend;
+                // the subscription is still live — skip and keep forwarding.
+                // Treating it as terminal left a connected frontend receiving
+                // nothing forever.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!(missed = n, "gateway: frontend forwarder lagged, dropping missed events");
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
             if ws_tx.send(Message::Text(msg.into())).await.is_err() {
                 break;
             }

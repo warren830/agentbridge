@@ -140,9 +140,14 @@ enum DaemonAction {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("agentbridge=info".parse()?))
-        .init();
+    // Respect a user-supplied RUST_LOG verbatim; only fall back to the default
+    // when none is set. Appending an `agentbridge=info` directive to the env
+    // filter used to OVERRIDE `RUST_LOG=agentbridge=debug` back to info
+    // (equal-specificity directives: last one wins), making field debugging
+    // silently impossible.
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("agentbridge=info"));
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let cli = Cli::parse();
 
@@ -455,8 +460,20 @@ async fn run_server(
         let mut event_rx = engines[0].subscribe_events();
         tracing::info!("gateway: event forwarder started, subscribed to engine broadcast");
         tokio::spawn(async move {
-            while let Ok((session_key, event)) = event_rx.recv().await {
-                tracing::info!(session_key = %session_key, "gateway: forwarding event to gateway client");
+            loop {
+                let (session_key, event) = match event_rx.recv().await {
+                    Ok(pair) => pair,
+                    // Lagged is recoverable: we missed some events during a
+                    // burst, but the subscription is still live. `while let
+                    // Ok` here used to treat it as terminal and silently
+                    // killed gateway forwarding for the rest of the run.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(missed = n, "gateway: event forwarder lagged, dropping missed events");
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                };
+                tracing::trace!(session_key = %session_key, "gateway: forwarding event to gateway client");
                 use gateway::protocol::*;
 
                 let payload = match &event {
@@ -485,7 +502,7 @@ async fn run_server(
                     },
                 };
                 match event_tx_clone.send(msg).await {
-                    Ok(_) => tracing::info!("gateway: event sent to client"),
+                    Ok(_) => tracing::trace!("gateway: event sent to client"),
                     Err(e) => tracing::error!("gateway: failed to send event to client: {}", e),
                 }
             }

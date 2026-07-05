@@ -82,24 +82,27 @@ impl HookRouteRegistry {
         }
     }
 
-    /// Bind a session's event sender under both its work_dir (canonicalized for
-    /// prefix matching) and, when known, its tmux session name (exact). The
-    /// tmux name is the reliable key for an attached session whose cwd differs
-    /// from the configured work_dir.
+    /// Bind a session's event sender. When a tmux session name is known it is
+    /// the ONLY key: a pane-hosted cc always reports its name ($TMUX is set),
+    /// so name matching is exact and sufficient. Registering the work_dir too
+    /// was a cross-talk hole — hooks are installed globally, so an unrelated
+    /// cc running under the work_dir tree (e.g. a desktop session, no $TMUX,
+    /// tmux_session="") would cwd-prefix-match this binding and inject ITS
+    /// Stop answer into this channel's turn (observed live 2026-07-05).
+    /// The work_dir key remains the fallback for name-less bindings only.
     pub fn bind(&self, work_dir: &str, tmux_session: Option<&str>, tx: mpsc::Sender<AgentEvent>) {
-        let key = normalize(work_dir);
         // A poisoned lock here only means a prior holder panicked while the map
         // was momentarily inconsistent; recovering the guard is safe for a plain
         // HashMap and lets the bridge keep working rather than aborting.
-        {
-            let mut map = self.by_work_dir.lock().unwrap_or_else(|e| e.into_inner());
-            tracing::info!(work_dir = %key, "hook route bound (work_dir)");
-            map.insert(key, tx.clone());
-        }
         if let Some(sess) = tmux_session.map(str::trim).filter(|s| !s.is_empty()) {
             let mut map = self.by_tmux_session.lock().unwrap_or_else(|e| e.into_inner());
             tracing::info!(tmux_session = %sess, "hook route bound (tmux session)");
             map.insert(sess.to_string(), tx);
+        } else {
+            let key = normalize(work_dir);
+            let mut map = self.by_work_dir.lock().unwrap_or_else(|e| e.into_inner());
+            tracing::info!(work_dir = %key, "hook route bound (work_dir)");
+            map.insert(key, tx);
         }
     }
 
@@ -232,6 +235,27 @@ mod tests {
         assert!(
             reg.resolve(None, Some(&dir)).is_some(),
             "exact cwd match must resolve"
+        );
+    }
+
+    #[test]
+    fn tmux_named_binding_does_not_leak_via_cwd() {
+        // A binding made WITH a tmux session name must NOT be resolvable by
+        // cwd. Hooks are installed globally, so any unrelated cc running under
+        // the work_dir tree (e.g. a desktop Claude Code session with no $TMUX)
+        // fires Stop hooks with tmux_session="" — a cwd-prefix fallback would
+        // inject THAT session's answers into this channel's turn (cross-
+        // session contamination, observed live 2026-07-05).
+        let reg = HookRouteRegistry::new();
+        let (tx, _rx) = drainable();
+        reg.bind("/Users/me/warren_ws", Some("nexus-ai"), tx);
+        assert!(
+            reg.resolve(Some("nexus-ai"), None).is_some(),
+            "name match must still resolve"
+        );
+        assert!(
+            reg.resolve(None, Some("/Users/me/warren_ws/agentbridge")).is_none(),
+            "cwd under the bound work_dir must NOT route when the binding has a tmux name"
         );
     }
 

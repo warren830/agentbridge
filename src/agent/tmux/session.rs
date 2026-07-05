@@ -352,10 +352,17 @@ async fn poll_loop(
     // Polls the screen must stay byte-identical before a turn counts as settled.
     // At 150ms/poll, 6 ticks ≈ 0.9s of no on-screen change.
     const STABLE_TICKS: u32 = 6;
-    // Extra settle margin before the hook-mode safety-net Result fires, giving a
-    // slightly-late Stop hook time to win the common case. At 150ms/poll, ~20
-    // ticks ≈ 3s of post-settle quiet before we conclude no Stop is coming.
-    const HOOK_SAFETY_NET_TICKS: u32 = 20;
+    // Extra settle margin before the hook-mode safety-net Result fires. The
+    // Stop hook is the primary turn-end channel; this net only recovers
+    // INTERRUPTED turns (no Stop coming), so it can afford to be slow. It must
+    // be generous because a user scrolling cc's history view mid-turn pins the
+    // pane on a static historical screen — spinner out of sight (busy=false),
+    // a historical `❯` echo reading as the input box (idle=true) — which is
+    // indistinguishable from a settled turn until they scroll back. At
+    // 150ms/poll, ~200 ticks ≈ 30s of post-settle quiet: brief history reading
+    // never misfires the net, an interrupted turn still unlocks in ~30s
+    // (vs 300s engine idle timeout, vs forever before the net existed).
+    const HOOK_SAFETY_NET_TICKS: u32 = 200;
     let mut stable_ticks: u32 = 0;
 
     loop {

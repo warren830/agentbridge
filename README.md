@@ -315,29 +315,69 @@ Why Feishu, vs Telegram/Discord:
 - **Native "working" feedback.** Since there's no bot typing API, agentbridge
   reacts 🫡 to your message on receipt and clears it when the reply lands.
 
-Setup:
+Setup (order matters — the long-connection step needs agentbridge already
+running with your credentials):
 
-1. Create a **custom app** (企业自建应用) at the [Feishu Open Platform](https://open.feishu.cn) (or [Lark](https://open.larksuite.com))
+1. Create a **custom app** (企业自建应用) at the [Feishu Open Platform](https://open.feishu.cn) (or [Lark](https://open.larksuite.com)).
+   **Every person/machine needs their OWN app** — see the cluster-mode note below.
 2. **Add the Bot capability** to the app (添加应用能力 → 机器人)
 3. **Permissions** (权限管理) — enable:
    - `im:message` — read messages sent to the bot
    - `im:message:send_as_bot` — send messages as the bot
-4. **Event subscription** (事件与回调 → 事件配置):
+4. Copy the **App ID** and **App Secret** (凭证与基础信息) into your config,
+   then **start agentbridge** — the next step requires a live connection
+5. **Event subscription** (事件与回调 → 事件配置):
    - Set the subscription mode to **「使用长连接接收事件」 (long-connection)**
-     — ⚠️ agentbridge must be running for this option to save (it requires a
-     live connection)
-   - Add the event **接收消息 `im.message.receive_v1`**
-5. **Publish a version** (版本管理与发布) so the bot capability + permissions take effect
-6. Copy the **App ID** and **App Secret** (凭证与基础信息) into your config
+     — it only saves once your running agentbridge has connected ("连接成功")
+   - Add the event **接收消息 `im.message.receive_v1`** — ⚠️ selecting
+     long-connection mode alone is NOT enough; without this event the
+     connection shows green but no message is ever delivered
+6. **Publish a version** (版本管理与发布) so the bot capability + permissions
+   take effect, and check the **availability scope (可用范围)** includes the
+   people who will talk to the bot (a fresh app can default to a narrow scope)
 7. **Add the bot to a group** — each group is one session, like a Discord channel
 8. Use `/attach <tmux-session>` in the group to bind it to a Claude Code session
+
+Agent-side prerequisites (per machine, easy to forget — the bot receives
+messages but stays silent without these):
+
+- a tmux session with Claude Code running inside it (the `/attach` target)
+- `agentbridge hook-install` once, then **restart** any already-running Claude
+  Code (hooks are read at startup) — in hook-relay mode the reply text travels
+  through the Stop hook
 
 Notes:
 - A "received, working on it" indicator is shown by reacting 🫡 to your message
   and removing it when the reply is sent (Feishu has no bot typing API).
 - A Feishu app's long-connection is **cluster mode** — only one client per app
-  receives each message. Don't point two tools (e.g. agentbridge and another
-  bot) at the **same** app; give each its own app.
+  receives each message. Two bridges on the same App ID (e.g. a colleague
+  copying your config) steal messages from each other at random; the same goes
+  for pointing agentbridge and another bot at one app. One app per bridge.
+
+Troubleshooting — bot shows "连接成功" but never responds: the green status
+only proves the socket is up; a message must then survive this chain. Check
+in order:
+
+1. **Same App ID as someone else?** Cluster mode (above) — each message is
+   delivered to exactly ONE connected client, so replies vanish at random on
+   both sides.
+2. **Event missing**: 接收消息 `im.message.receive_v1` must appear in the
+   event list — the long-connection mode toggle alone delivers nothing.
+3. **Not published / out of scope**: permissions apply only after 发布版本,
+   and the sender must be inside the app's 可用范围. Custom apps work only
+   inside their own tenant.
+4. **`allow_from` filter**: if set in your config, senders not on the list
+   are dropped **silently**. Leave it unset (or `"*"`) while setting up.
+5. **Group gates**: the bot must be a member of the group; with
+   `group_reply_all: false` it only answers when @mentioned.
+6. **Localize with logs**: run `RUST_LOG=agentbridge=debug agentbridge run`,
+   send a test message, and look for `handle_message: received`:
+   - absent → the message never reached the bridge — the problem is on the
+     Feishu side (points 1-5);
+   - present but no reply → Feishu is fine, the agent side is failing —
+     check `tmux ls` shows your session, Claude Code is running inside it,
+     `/attach` was issued in the group, and `hook-install` + cc restart were
+     done.
 
 ---
 

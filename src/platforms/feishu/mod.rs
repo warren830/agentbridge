@@ -70,10 +70,33 @@ fn default_true() -> bool {
 #[derive(Debug)]
 struct TracingLogger;
 
+/// Scrub credential-bearing query parameters from SDK log lines. The SDK's
+/// stream-connect line embeds the full wss URL — including short-lived
+/// `access_key` and `ticket` credentials — at Info level; log files must not
+/// become a credential sink. Values are replaced up to the next `&`,
+/// whitespace, or quote so the rest of the line stays diagnosable.
+fn redact_credentials(message: &str) -> String {
+    let mut msg = message.to_string();
+    for key in ["access_key", "ticket"] {
+        let needle = format!("{key}=");
+        let mut search_from = 0;
+        while let Some(rel) = msg[search_from..].find(&needle) {
+            let start = search_from + rel + needle.len();
+            let end = msg[start..]
+                .find(|c: char| c == '&' || c == '"' || c == '\'' || c.is_whitespace())
+                .map_or(msg.len(), |i| start + i);
+            msg.replace_range(start..end, "[REDACTED]");
+            search_from = start + "[REDACTED]".len();
+        }
+    }
+    msg
+}
+
 impl Logger for TracingLogger {
     // No custom `target:` — the default (this module's path) already matches
     // the `agentbridge=info` EnvFilter; a foreign target would be filtered out.
     fn log(&self, level: LogLevel, message: &str) {
+        let message = redact_credentials(message);
         match level {
             LogLevel::Error => tracing::error!("feishu-sdk: {message}"),
             LogLevel::Warn => tracing::warn!("feishu-sdk: {message}"),
@@ -613,5 +636,21 @@ mod tests {
     fn parse_message_id_missing() {
         assert_eq!(parse_message_id(b"{\"code\":0}"), None);
         assert_eq!(parse_message_id(b"not json"), None);
+    }
+
+    #[test]
+    fn redact_credentials_scrubs_stream_url() {
+        let line = "Stream connected: wss://msg.feishu.cn/ws/v2?fpid=493&access_key=9636116aa2e16264&service_id=33554678&ticket=3ddff094-0f79 [device_id=766]";
+        let out = redact_credentials(line);
+        assert!(!out.contains("9636116aa2e16264"));
+        assert!(!out.contains("3ddff094-0f79"));
+        assert!(out.contains("access_key=[REDACTED]&service_id=33554678"));
+        assert!(out.contains("ticket=[REDACTED] [device_id=766]"));
+    }
+
+    #[test]
+    fn redact_credentials_leaves_clean_lines_alone() {
+        let line = "Dispatching event: im.message.receive_v1";
+        assert_eq!(redact_credentials(line), line);
     }
 }

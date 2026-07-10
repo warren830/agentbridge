@@ -962,6 +962,16 @@ async fn run_doctor(config_path: Option<String>) -> anyhow::Result<()> {
 }
 
 fn run_daemon(action: DaemonAction) -> anyhow::Result<()> {
+    // Every daemon subcommand shells out to systemctl/journalctl; on hosts
+    // without systemd that surfaces as a bare ENOENT ("No such file or
+    // directory"). Fail early with an actionable message instead.
+    if cfg!(target_os = "macos") {
+        anyhow::bail!(
+            "daemon mode requires systemd (Linux only). On macOS run the bridge in the \
+             foreground with `agentbridge run`, or keep it in the background with:\n  \
+             nohup agentbridge run > ~/.agentbridge/agentbridge.log 2>&1 &"
+        );
+    }
     match action {
         DaemonAction::Install => daemon::install_systemd_service(),
         DaemonAction::Uninstall => daemon::uninstall_systemd_service(),

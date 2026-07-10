@@ -32,6 +32,12 @@ export interface StageEntry {
   inputs?: string;
   outputs?: string;
   for_each?: string;
+  // True for stages that must write source code to the workspace root (not just
+  // planning docs under the per-intent record dir). The stage-completion artifact
+  // guard (aidlc-state.ts) uses this to require a non-doc workspace file before
+  // approve/advance: a code-generation stage that wrote only its markdown
+  // produces[] docs but no actual code must not pass (issue #366).
+  workspace_requires?: boolean;
 }
 
 export interface ScopeDefinition {
@@ -311,6 +317,12 @@ export const WORKSPACE_VERBS: ReadonlySet<string> = new Set([
   "space-create",
   "intent",
 ]);
+// Slugs a record (intent or space) may never take. "help" is grammar: the
+// router treats `intent help` / `space help` as a help request, so a record
+// with that slug would be unswitchable by name. Refusing it at the creation
+// chokepoints (birthIntent, handleSpaceCreate) keeps the namespace and the
+// grammar from ever colliding.
+export const RESERVED_RECORD_NAMES: ReadonlySet<string> = new Set(["help"]);
 
 // A classified terminal command: the aidlc-utility.ts subcommand to run, plus an
 // optional positional arg (the <name> for a workspace verb). `source` records
@@ -329,6 +341,13 @@ export interface TerminalCommand {
 // (read-only flag anywhere; workspace verb only at index 0) so the seam and the
 // engine can never disagree about what is terminal.
 export function classifyTerminalCommand(args: string[]): TerminalCommand | null {
+  // A SOLE bare `help` / `-h` token is a help REQUEST (terminal, read-only);
+  // mirrors parseNextFlags in the engine. Without this the token reads as
+  // freeform intent text and the funnel offers to birth an intent named
+  // "help". Sole-token only: `help` inside a longer description stays freeform.
+  if (args.length === 1 && (args[0] === "help" || args[0] === "-h")) {
+    return { subcommand: "help", source: "read-only-flag" };
+  }
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (READ_ONLY_FLAGS.has(a)) {
@@ -337,6 +356,16 @@ export function classifyTerminalCommand(args: string[]): TerminalCommand | null 
     if (i === 0 && WORKSPACE_VERBS.has(a)) {
       const next = args[i + 1];
       const arg = next !== undefined && !next.startsWith("--") ? next : undefined;
+      // `intent help`/`-h` / `space help`/`-h` is a help request, not a switch
+      // to a record named "help" (no per-verb help exists; the failed switch's
+      // error text steers the conductor into birthing an intent, and "help" is
+      // a reserved record name - see RESERVED_RECORD_NAMES). Mirrors
+      // parseNextFlags. space-create is excluded: its handler refuses a
+      // help-shaped name itself rather than silently printing help (the
+      // reserved-name guard alone would miss "-h", which slugifies to "h").
+      if ((a === "intent" || a === "space") && (arg === "help" || arg === "-h")) {
+        return { subcommand: "help", source: "read-only-flag" };
+      }
       return arg !== undefined
         ? { subcommand: a, arg, source: "workspace-verb" }
         : { subcommand: a, source: "workspace-verb" };
@@ -1036,6 +1065,11 @@ export function birthIntent(
   // when the caller passes raw text (cap 24). A same-day same-label clash resolves
   // by a numeric counter (never re-mints).
   const slug = slugify(label, 24);
+  if (RESERVED_RECORD_NAMES.has(slug)) {
+    throw new Error(
+      `"${slug}" is a reserved name and cannot be an intent label. Pick a label that describes the work.`
+    );
+  }
   const dirName = resolveUniqueIntentDir(intentsRoot, `${dateStamp()}-${slug}`);
   const recordPath = join(intentsRoot, dirName);
   mkdirSync(recordPath, { recursive: true });
@@ -1314,6 +1348,99 @@ function cloneId(projectDir: string): string {
     _cloneId = minted; // unwritable workspace → in-memory token
   }
   return _cloneId;
+}
+
+// --- Human presence at an approval/interview gate ---
+//
+// Ledger-event presence check (the marker-free design). A real human
+// is present for THIS gate-commit iff a HUMAN_TURN event appears AFTER the LAST
+// GATE RESOLUTION (GATE_APPROVED / GATE_REJECTED / QUESTION_ANSWERED) in ledger
+// append order. The prior resolution is the freshness boundary - this is the
+// consume-once semantics expressed as event order instead of a flag.
+//
+// Why the boundary is the prior RESOLUTION, not this gate's STAGE_AWAITING_APPROVAL
+// (the live Kiro IDE spike, 2026-06-30, caught this): in the real flow ONE human
+// prompt drives the agent to BOTH open the gate AND approve it, so the human turn
+// PRECEDES this gate-open. A "human turn after gate-open" rule false-refuses every
+// legitimate approval. But a human turn after the prior gate's resolution still
+// proves a fresh human acted this turn, while a fabricated cascade (gate2 approved
+// right after gate1 committed, no new human turn) has its only human turn BEFORE
+// the gate1 GATE_APPROVED -> refused. Stale (human turn long ago, then a fabricated
+// approve) likewise has the last resolution after the human turn -> refused.
+//
+// Ordering is CHRONOLOGICAL (Timestamp, then buffer position as the tiebreak),
+// matching findAllEvents: readAllAuditShards concatenates per-clone shards in
+// FILENAME order, so the raw buffer is NOT time-ordered across shards (a second
+// shard appears after a re-clone or on another machine) and a raw-position scan
+// could rank an OLD resolution from a lexically-later shard above a fresh
+// HUMAN_TURN. Within one shard the timestamps are non-decreasing and the position
+// tiebreak preserves append order, which is what makes same-second events (the
+// common case: one human turn drives mint + gate + resolution inside one second)
+// resolve by execution order. Fail-open when no ledger exists (no presence
+// tracking yet on this harness).
+//
+// The resolution boundary is workflow-global (the most recent commit of ANY
+// gate), which is what makes a same-turn cascade across DIFFERENT stages refuse
+// correctly; there is no per-stage scoping.
+const GATE_RESOLUTION_EVENTS = new Set(["GATE_APPROVED", "GATE_REJECTED", "QUESTION_ANSWERED"]);
+export function humanActedSinceGate(projectDir: string): boolean {
+  const audit = readAllAuditShards(projectDir);
+  if (audit.length === 0) return true; // no ledger → no presence tracking → fail open
+  const blocks = audit.replace(/\r\n/g, "\n").split(/\n---\n/);
+  const events: { ts: string; pos: number; human: boolean }[] = [];
+  for (let i = 0; i < blocks.length; i++) {
+    const ev = auditBlockField(blocks[i], "Event");
+    if (!ev) continue;
+    if (!GATE_RESOLUTION_EVENTS.has(ev) && ev !== "HUMAN_TURN") continue;
+    events.push({
+      ts: auditBlockField(blocks[i], "Timestamp") ?? "",
+      pos: i,
+      human: ev === "HUMAN_TURN",
+    });
+  }
+  events.sort((a, b) => {
+    if (a.ts !== b.ts) return a.ts < b.ts ? -1 : 1;
+    return a.pos - b.pos;
+  });
+  let lastResolution = -1;
+  let lastHuman = -1;
+  for (let i = 0; i < events.length; i++) {
+    if (events[i].human) lastHuman = i;
+    else lastResolution = i;
+  }
+  // A human turn appears after the last gate resolution (or there is a human turn
+  // and no resolution yet) => a fresh human acted this turn => allow.
+  return lastHuman > lastResolution && lastHuman !== -1;
+}
+
+// True when any stage sits at [?] (awaiting-approval) in the state file: the
+// "a gate is actually OPEN" predicate for the per-harness preToolUse floors.
+// Without it a floor would keep refusing tool calls AFTER a legitimate approval
+// (the resolution then follows the turn's only HUMAN_TURN), blocking the
+// same-turn continuation the stage protocol mandates.
+export function hasOpenGate(stateContent: string | null): boolean {
+  if (!stateContent) return false;
+  return parseCheckboxes(stateContent).some((c) => c.state === "awaiting-approval");
+}
+
+// The interview path (handleAnswer) uses the SAME resolution-boundary check: a
+// QUESTION_ANSWERED is itself a gate resolution, so "a human turn since the last
+// resolution" gives one-answer-per-human-turn for free. Thin alias for call-site
+// readability; both paths share one definition so the predicate cannot drift.
+export function humanActedSinceLastAnswer(projectDir: string): boolean {
+  return humanActedSinceGate(projectDir);
+}
+
+// Read a `**Field**: value` line from one audit block (tolerates an optional
+// leading `- ` so it serves both audit blocks and the state file). Mirrors the
+// per-tool private auditField readers; shared here for humanActedSinceGate.
+export function auditBlockField(block: string, fieldName: string): string | null {
+  const prefix = `**${fieldName}**:`;
+  for (const raw of block.split("\n")) {
+    const line = raw.startsWith("- ") ? raw.slice(2) : raw;
+    if (line.startsWith(prefix)) return line.slice(prefix.length).trim();
+  }
+  return null;
 }
 
 // This clone's audit shard filename: `<host>-<clone-id>.md`. The clone-id token
@@ -1917,6 +2044,27 @@ export function getField(content: string, field: string): string | null {
   return match ? match[1].trim() : null;
 }
 
+// --- Autonomy mode ---
+//
+// The state-file field that distinguishes autonomous Construction (swarm/Bolt)
+// from interactive flow. Promoted to ONE exported predicate so the human-
+// presence gate's carve-out and the existing open-coded `=== "autonomous"`
+// sites cannot drift. (This PR uses the helper only at the NEW gate sites;
+// refactoring the existing open-coded sites is a tracked follow-up.)
+export const AUTONOMY_MODE_FIELD = "Construction Autonomy Mode";
+
+export function isAutonomousMode(stateContent: string | null): boolean {
+  return !!stateContent && getField(stateContent, AUTONOMY_MODE_FIELD)?.trim() === "autonomous";
+}
+
+// Deterministic off-switch for the human-presence gate (mirrors
+// artifactGuardDisabled in aidlc-state.ts). The suite sets this globally (the
+// dedicated guard test clears it), and it is the documented bypass for
+// synthetic CI runs that drive approve/answer against bare fixtures.
+export function humanPresenceGuardDisabled(): boolean {
+  return process.env.AIDLC_SKIP_HUMAN_PRESENCE_GUARD === "1";
+}
+
 export function setField(content: string, field: string, value: string): string {
   // [ \t]* instead of \s* so an empty value doesn't let the regex eat the
   // following line. .* with the m flag does not cross lines on its own, but
@@ -1968,6 +2116,19 @@ export function setOrInsertField(
     return content.replace(regex, `$1 ${value}`);
   }
   return appendUnderHeading(content, heading, `- **${field}**: ${value}\n`);
+}
+
+// removeField: delete the `- **Field**: ...` bullet line if present; a no-op
+// otherwise. The inverse of setOrInsertField, for runtime-only fields that are
+// cleared rather than reset (e.g. the `Parked` / `Parked At Stage` markers an
+// `unpark` removes). Matches the bullet at line start and drops the whole line
+// including its trailing newline so no blank line is left behind.
+export function removeField(content: string, field: string): string {
+  const regex = new RegExp(
+    `^- \\*\\*${escapeRegex(field)}\\*\\*:[ \\t]*.*(?:\\r?\\n)?`,
+    "m"
+  );
+  return content.replace(regex, "");
 }
 
 // --- Refs-list field operations (Bolt Refs in v7 state template) ---
@@ -2067,6 +2228,24 @@ export function setCheckbox(
     "m"
   );
   return content.replace(regex, `$1${marker}$2`);
+}
+
+// The suffix-setter twin of setCheckbox: flips ONE stage line's plan suffix
+// (the em-dash EXECUTE/SKIP tail the router's override channel reads)
+// in either direction, leaving the checkbox marker untouched. setCheckbox owns
+// the marker (run-state); this owns the suffix (the plan) - the two edit
+// disjoint fields of the same line, so recompose and jump compose cleanly.
+// Returns the content unchanged when the slug has no stage line.
+export function setStageSuffix(
+  content: string,
+  slug: string,
+  action: "EXECUTE" | "SKIP"
+): string {
+  const regex = new RegExp(
+    `^(- \\[[ xSR?-]\\] ${escapeRegex(slug)}\\s*—\\s*)(EXECUTE|SKIP)\\b`,
+    "m"
+  );
+  return content.replace(regex, `$1${action}`);
 }
 
 export function countCheckboxes(
@@ -2656,7 +2835,10 @@ function stageGraphPath(): string {
   return process.env.AIDLC_STAGE_GRAPH ?? join(DATA_DIR, "stage-graph.json");
 }
 
-function scopeGridPath(): string {
+// Exported so the read-only `detect` verb can TELL the composer agent where
+// the runtime scope registry lives (the paths are module-relative to the
+// installed tool, which a prose agent cannot derive itself).
+export function scopeGridPath(): string {
   return process.env.AIDLC_SCOPE_GRID ?? join(DATA_DIR, "scope-grid.json");
 }
 
@@ -2674,7 +2856,9 @@ function scopeMappingPath(): string | null {
 // env-var seam mirrors AIDLC_SENSORS_DIR / AIDLC_RULES_DIR so fixture tests
 // can point the scope-metadata loader at an isolated tree. Evaluated at call
 // time so tests that set/unset mid-process see the change.
-function scopesDir(): string {
+// Exported for the same reason as scopeGridPath: `detect --json` prints it so
+// the composer agent is told the authoritative write target per harness.
+export function scopesDir(): string {
   return process.env.AIDLC_SCOPES_DIR ?? join(dirname(fileURLToPath(import.meta.url)), "..", "scopes");
 }
 
@@ -3044,6 +3228,18 @@ export function parseStageFrontmatter(
     }
   }
 
+  // workspace_requires is the one boolean scalar field. The generic scalar loop
+  // above captured it as a string ("true"/"false"); coerce to a real boolean so
+  // StageEntry/GraphStage and the schema validator see the typed value (mirrors
+  // consumes.required's "true"/"false" coercion in objectListField). A non-boolean
+  // token is left as the string so validateStageFrontmatter rejects it loudly.
+  if (typeof obj.workspace_requires === "string") {
+    const raw = obj.workspace_requires;
+    if (raw === "true" || raw === "false") {
+      obj.workspace_requires = raw === "true";
+    }
+  }
+
   return obj;
 }
 
@@ -3273,6 +3469,7 @@ export function emitStageFrontmatter(obj: Record<string, unknown>): string {
     "reviewer",
     "reviewer_max_iterations",
     "for_each",
+    "workspace_requires",
     "produces",
     "consumes",
     "requires_stage",
@@ -3326,6 +3523,11 @@ export function emitStageFrontmatter(obj: Record<string, unknown>): string {
       // how stages author it on disk (`reviewer_max_iterations: 2`). Without
       // this branch the numeric value the parser now returns (V1) would be
       // dropped on emit, breaking the parse -> emit -> parse contract (t65).
+      lines.push(`${key}: ${v}`);
+    } else if (typeof v === "boolean") {
+      // workspace_requires round-trips as an unquoted boolean (the parser
+      // coerces the "true"/"false" token to a real boolean), so emit it
+      // unquoted to preserve the parse -> emit -> parse contract.
       lines.push(`${key}: ${v}`);
     }
   }

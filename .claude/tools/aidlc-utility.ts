@@ -19,6 +19,7 @@ import {
   loadRules,
   memoryDirFor,
   stageGraphDrift,
+  validateGrid,
   validateScope,
 } from "./aidlc-graph.ts";
 import { repointHarnessIncludes } from "./aidlc-includes.ts";
@@ -44,6 +45,7 @@ import {
   isPackageJson,
   codekbRepoName,
   relativeCodekbDir,
+  RESERVED_RECORD_NAMES,
   listIntents,
   listSpaces,
   loadAgents,
@@ -57,6 +59,7 @@ import {
   parseCheckboxes,
   parseRefsList,
   parseStageFrontmatter,
+  parseStateStageSuffixes,
   readAllAuditShards,
   readCurrentSessionId,
   readStateFile,
@@ -70,6 +73,9 @@ import {
   type StageEntry,
   setCheckbox,
   setField,
+  setStageSuffix,
+  scopeGridPath,
+  scopesDir,
   stagesInScope,
   stateFilePath,
   withAuditLock,
@@ -159,6 +165,9 @@ Scopes (set depth, test strategy, and stage count):
 const HELP_TEXT_TAIL = `
 Utilities:
   --status          Show current workflow progress (read-only)
+  compose "<task>"  Propose a tailored EXECUTE/SKIP plan (mid-workflow: re-shape the pending stages)
+  compose --report <path>  Compose from a scan report (triage findings into a fix-and-ship run)
+  --new-scope "<task>"  Force the composer to synthesize a custom scope even when a stock scope matches
   intent            List intents in the active space (read-only; --json for structured output)
   intent <name>     Switch the active intent
   space             List spaces (read-only; --json for structured output)
@@ -175,13 +184,13 @@ Utilities:
   --help            Show this help message
 
 Other:
-  --test-run        Auto-approve all gates (for automated testing only)
   <description>     Describe what to build — scope is auto-detected
   (no arguments)    Resume existing workflow, or start fresh if none exists
 
 Examples:
   /aidlc feature                                Start a feature workflow
   /aidlc Fix the login timeout bug              Auto-detected as bugfix scope
+  /aidlc compose "harden the deploy pipeline"   Composer proposes a tailored plan
   /aidlc                                        Resume or begin
   /aidlc --stage code-generation                Jump to code-generation stage
   /aidlc --phase construction --scope bugfix    Jump to construction with bugfix scope
@@ -290,11 +299,17 @@ To get started:
     statusLine = `${displayName} approved — ready to advance`;
   }
 
-  // Checkbox counts — filter to in-scope stages when scope is known
+  // Checkbox counts - filter to the EFFECTIVE plan when scope is known: the
+  // state file's per-stage EXECUTE/SKIP suffixes (a recomposed plan) override
+  // the static grid, so status counts against what the router will actually
+  // run, not the pre-recompose column.
   const checkboxes = parseCheckboxes(content);
+  const suffixOverrides = parseStateStageSuffixes(content);
   const inScopeInfo = stagesInScope(scope);
   const inScopeSlugs = new Set(
-    inScopeInfo.filter((s) => s.action === "EXECUTE").map((s) => s.slug)
+    inScopeInfo
+      .filter((s) => (suffixOverrides.get(s.slug) ?? s.action) === "EXECUTE")
+      .map((s) => s.slug)
   );
   const scopedCheckboxes =
     scope !== "Unknown" && inScopeSlugs.size > 0
@@ -2167,6 +2182,14 @@ function handleIntentBirth(projectDir: string, flags: Record<string, string>): v
     const label = flags.label?.trim();
     const slugSource = label || description || scope;
     const slug = slugify(slugSource, 24);
+    // "help" is grammar (`intent help` prints help), so an intent slugged
+    // "help" would be unswitchable by name. birthIntent throws on it too
+    // (library backstop); dying here keeps the clean JSON error shape.
+    if (RESERVED_RECORD_NAMES.has(slug)) {
+      die(
+        `"${slug}" is a reserved name and cannot be an intent label. Pick a label that describes the work.`
+      );
+    }
     birthIntent(projectDir, slug, activeSpace(projectDir), scope, repos);
 
     const ts = isoTimestamp();
@@ -2429,7 +2452,6 @@ function handleIntentBirthStateBuild(
 
 ## Runtime State
 - **Revision Count**: 0
-${flags["test-run"] === "true" ? "- **Test Run Mode**: true\n" : ""}
 
 ## Phase Progress
 <!-- Status values: Pending, Active, Verified, Skipped -->
@@ -2599,6 +2621,16 @@ function handleIntent(projectDir: string, positional: string[], flags: Record<st
     printIntentListing(projectDir, asJson);
     return;
   }
+  // `intent help`/`-h` is a help request, not a switch to a record named
+  // "help" ("help" is a reserved record name, so no real record is shadowed).
+  // The engine routes it to help before it ever reaches this tool; this arm is
+  // the backstop for a direct invocation, so a confused caller gets the help
+  // text instead of an "Unknown intent" error that reads like an invitation to
+  // start new work.
+  if (target === "help" || target === "-h") {
+    handleHelp();
+    return;
+  }
   const space = activeSpace(projectDir);
   const intents = listIntents(projectDir, space);
   // Exact record-dir match first; then a unique slug match.
@@ -2613,8 +2645,12 @@ function handleIntent(projectDir: string, positional: string[], flags: Record<st
     }
   }
   if (!match || match.dirName === null) {
+    // Deliberately NOT "describe what to build to start a new one": a conductor
+    // recovering from a failed switch read that as an instruction and birthed an
+    // unwanted intent. Point at the read-only listing only; starting new work
+    // stays a separate, human-confirmed move.
     die(
-      `Unknown intent "${target}" in space "${space}". Run /aidlc intent to list, or describe what to build to start a new one.`
+      `Unknown intent "${target}" in space "${space}". This command only switches between existing intents - run /aidlc intent to list them. Do not start a new workflow to recover from this error.`
     );
   }
   setActiveIntentCursor(projectDir, match.dirName, space);
@@ -2652,6 +2688,13 @@ function handleSpace(projectDir: string, positional: string[], flags: Record<str
     printSpaceListing(projectDir, asJson);
     return;
   }
+  // `space help`/`-h` is a help request, not a switch to a space named "help"
+  // - same backstop as handleIntent (the engine routes it to help upstream,
+  // and "help" is a reserved space name).
+  if (raw === "help" || raw === "-h") {
+    handleHelp();
+    return;
+  }
   // Spaces are STORED under their slug (handleSpaceCreate writes slugify(raw)),
   // so slugify the switch target before lookup AND before the cursor write —
   // otherwise `/aidlc space "My Space"` (stored as my-space) would miss.
@@ -2659,7 +2702,7 @@ function handleSpace(projectDir: string, positional: string[], flags: Record<str
   const spaces = listSpaces(projectDir);
   if (!spaces.some((s) => s.name === target)) {
     die(
-      `Unknown space "${target}". Existing: ${spaces.map((s) => s.name).join(", ")}. Create it with /aidlc space-create ${target}.`
+      `Unknown space "${target}". Existing: ${spaces.map((s) => s.name).join(", ")}. This command only switches between existing spaces. Do not create a space to recover from this error - creating one is a separate, deliberate move (/aidlc space-create <name>).`
     );
   }
   setActiveSpaceCursor(projectDir, target);
@@ -2692,6 +2735,40 @@ function handleCodekbPath(projectDir: string, flags: Record<string, string>): vo
   process.stdout.write(`${dir}/\n`);
 }
 
+// `detect [--json]` - read-only. Runs the workspace scan (detectWorkspace) on
+// the bare project dir - it needs no aidlc/ workspace; it scans the app root -
+// and prints projectType (Greenfield/Brownfield), languages, frameworks, and
+// buildSystem. ALSO prints the resolved scope-registry paths (scopesDir +
+// scopeGridPath): those are module-relative to the installed tool, which a
+// prose agent cannot derive itself, so the composer agent is TOLD where the
+// runtime reads scope data (and therefore where an authored scope must land).
+// Writes nothing, no audit, no mkdir - mirrors codekb-path's read-only shape.
+function handleDetect(projectDir: string, flags: Record<string, string>): void {
+  const scan = detectWorkspace(projectDir);
+  const payload = {
+    projectType: scan.projectType,
+    languages: scan.languages,
+    frameworks: scan.frameworks,
+    buildSystem: scan.buildSystem,
+    scopesDir: scopesDir(),
+    scopeGridPath: scopeGridPath(),
+    scopes: [...validScopes()],
+  };
+  if (flags.json === "true") {
+    process.stdout.write(`${JSON.stringify(payload)}\n`);
+    return;
+  }
+  process.stdout.write(
+    `Project type: ${payload.projectType}\n` +
+      `Languages: ${payload.languages}\n` +
+      `Frameworks: ${payload.frameworks}\n` +
+      `Build system: ${payload.buildSystem}\n` +
+      `Scopes dir: ${payload.scopesDir}\n` +
+      `Scope grid: ${payload.scopeGridPath}\n` +
+      `Valid scopes: ${payload.scopes.join(", ")}\n`,
+  );
+}
+
 // `/aidlc space-create <name>` — seed a NEW space's memory. org.md is copied
 // from spaces/default/memory/org.md (the always-present SEED baseline), plus
 // fresh empty team.md/project.md/phases stubs + the templates/ floor. A new team
@@ -2701,7 +2778,20 @@ function handleCodekbPath(projectDir: string, flags: Record<string, string>): vo
 function handleSpaceCreate(projectDir: string, positional: string[], _flags: Record<string, string>): void {
   const raw = positional[1];
   if (!raw) die("Usage: aidlc-utility space-create <name>");
+  // A help-shaped arg is a help request, not a name. Checked BEFORE slugify:
+  // slugify("-h") is "h", which is not a reserved name, so the guard below
+  // would let it through and a junk space would be created.
+  if (raw === "-h" || raw === "help") {
+    die("Did you mean /aidlc --help? To create a space, pass a name: /aidlc space-create <name>.");
+  }
   const name = slugify(raw);
+  // "help" is grammar (`space help` prints help), so a space with that slug
+  // would be unswitchable by name - refuse it here, the creation chokepoint.
+  if (RESERVED_RECORD_NAMES.has(name)) {
+    die(
+      `"${name}" is a reserved name and cannot be a space name. Pick a name that describes the team.`
+    );
+  }
   const dest = join(spacesRoot(projectDir), name);
   if (existsSync(dest)) die(`Space "${name}" already exists at ${dest}.`);
 
@@ -2934,6 +3024,226 @@ Completed: ${completedCount}/${executeStages.length}
 }
 
 // ---------------------------------------------------------------------------
+// recompose - flip a PENDING stage's plan suffix on the live state file
+// (the adaptive composer's in-flight write). `--skip <slugs>` drops stages
+// from the plan; `--add <slugs>` promotes them back (comma-separated). The
+// whole mutation runs under withAuditLock; validation is STRICT (a starved
+// required input rejects, not advises); the derived state fields are rebuilt
+// the way scope-change rebuilds them; a RECOMPOSED audit event lands with the
+// flip lists. A run that never calls recompose is byte-identical to before -
+// the verb is inert when unused.
+// ---------------------------------------------------------------------------
+
+function handleRecompose(projectDir: string, flags: Record<string, string>): void {
+  const skipList = (flags.skip ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+  const addList = (flags.add ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+  if (skipList.length === 0 && addList.length === 0) {
+    die("Usage: recompose [--skip <slug,...>] [--add <slug,...>] - name at least one flip.");
+  }
+  const overlap = skipList.filter((s) => addList.includes(s));
+  if (overlap.length > 0) {
+    die(`Cannot both --skip and --add the same stage: ${overlap.join(", ")}.`);
+  }
+
+  const sp = stateFilePath(projectDir, flags.intent, flags.space);
+  if (!existsSync(sp)) {
+    die("No state file found. recompose re-shapes a RUNNING workflow; start one first.");
+  }
+
+  withAuditLock(projectDir, () => {
+    let content = readStateFile(projectDir, flags.intent, flags.space);
+    // Only a RUNNING workflow has a live plan to re-shape. A Completed (or
+    // Parked/terminated) state file is a terminal record: flipping its rows
+    // would grow Total Stages under a summary computed at completion and
+    // leave no cursor to ever reach the added stage — a corrupted record,
+    // not a plan change. (With no cursor, the behind-cursor guard below is
+    // also inert, so this check is the only thing standing between recompose
+    // and a finished workflow.)
+    const wfStatus = getField(content, "Status") || "";
+    if (wfStatus !== "Running") {
+      die(
+        `Cannot recompose: workflow Status is "${wfStatus || "unknown"}", not Running. ` +
+          "Recompose re-shapes a LIVE plan; for finished work start a new workflow instead.",
+      );
+    }
+    const scope = getField(content, "Scope");
+    if (!scope) die("Cannot read current Scope from state file.");
+    const scopeDef = loadScopeMapping()[scope];
+    if (!scopeDef) die(`Unknown scope in state file: ${scope}.`);
+
+    const graph = loadStageGraph();
+    const knownSlugs = new Set(graph.map((s) => s.slug));
+    const checkboxes = parseCheckboxes(content);
+    const checkboxMap = new Map(checkboxes.map((c) => [c.slug, c.state]));
+    const suffixes = parseStateStageSuffixes(content);
+    const currentSlug = getField(content, "Current Stage") || "";
+    const currentIdx = graph.findIndex((s) => s.slug === currentSlug);
+
+    // The effective pre-flip plan (suffix override wins over the grid).
+    const effective = (slug: string): "EXECUTE" | "SKIP" => {
+      const v = suffixes.get(slug) ?? scopeDef.stages[slug];
+      return v === "EXECUTE" ? "EXECUTE" : "SKIP";
+    };
+
+    // --- Per-flip guards: pending-only, ahead-of-cursor, skeleton-gate ------
+    const reject = (slug: string, why: string): never =>
+      die(`Cannot recompose "${slug}": ${why}`);
+
+    for (const slug of [...skipList, ...addList]) {
+      if (!knownSlugs.has(slug)) {
+        reject(slug, "not a compiled stage.");
+      }
+      const state = checkboxMap.get(slug);
+      if (state === "completed" || state === "in-progress" || state === "skipped" ||
+          state === "awaiting-approval" || state === "revising") {
+        reject(slug, `its checkbox is not pending ([${state}]). Only a PENDING stage's plan can be re-shaped; completed/in-progress/skipped stages are frozen.`);
+      }
+      const idx = graph.findIndex((s) => s.slug === slug);
+      if (currentIdx !== -1 && idx !== -1 && idx <= currentIdx) {
+        reject(slug, `it is at or behind the current stage ("${currentSlug}"). In-flight recompose only reaches forward; re-running the past is out of scope.`);
+      }
+    }
+
+    // The walking-skeleton gate derivation keys off the FIRST construction
+    // EXECUTE stage (static). A flip that MOVES that anchor - skipping the
+    // current anchor, or adding a construction stage AHEAD of it - would
+    // silently relocate Bolt 1 and the skeleton stance round-trip. Compare
+    // the anchor before and after the proposed flips and reject any move
+    // (the cheapest sound answer; a suffix-aware gate derivation is a larger
+    // change this verb must not smuggle in).
+    const anchorOf = (plan: (slug: string) => "EXECUTE" | "SKIP"): string | undefined =>
+      graph.find((s) => s.phase === "construction" && plan(s.slug) === "EXECUTE")?.slug;
+    const anchorBefore = anchorOf(effective);
+    const anchorAfter = anchorOf((slug) => {
+      if (skipList.includes(slug)) return "SKIP";
+      if (addList.includes(slug)) return "EXECUTE";
+      return effective(slug);
+    });
+    if (anchorBefore !== anchorAfter) {
+      const mover =
+        anchorBefore && skipList.includes(anchorBefore) ? anchorBefore : (anchorAfter ?? anchorBefore ?? "construction");
+      reject(
+        mover,
+        `the flip moves the first EXECUTE stage of Construction (the walking-skeleton gate anchor) from "${anchorBefore ?? "none"}" to "${anchorAfter ?? "none"}". The skeleton gate must stay anchored; jump or change scope instead.`,
+      );
+    }
+
+    // --- Build the proposed effective grid and validate STRICT --------------
+    // Strictness is a DIFF against the pre-flip baseline: a stock scope may be
+    // BORN with structural advisories (e.g. bugfix's code-generation consumes
+    // unit-of-work from the skipped units-generation - the scope author owns
+    // that upstream work), and those must not veto an unrelated flip. What the
+    // recompose validator hard-rejects is NEW starvation the flips introduce:
+    // any strict error present post-flip that was absent pre-flip.
+    const baseGrid: Record<string, string> = {};
+    for (const s of graph) baseGrid[s.slug] = effective(s.slug);
+    const proposed: Record<string, string> = { ...baseGrid };
+    for (const slug of skipList) proposed[slug] = "SKIP";
+    for (const slug of addList) proposed[slug] = "EXECUTE";
+    // Stages already completed [x] satisfy their consumers even if the plan
+    // now skips them - mark them EXECUTE for the dependency walk (in BOTH
+    // grids) so a flip after a producer already ran is not falsely starved.
+    for (const c of checkboxes) {
+      if (c.state === "completed") {
+        baseGrid[c.slug] = "EXECUTE";
+        proposed[c.slug] = "EXECUTE";
+      }
+    }
+    const projectType = (getField(content, "Project Type") || "").toLowerCase();
+    const pt = projectType === "brownfield" || projectType === "greenfield"
+      ? (projectType as "brownfield" | "greenfield")
+      : undefined;
+    const label = `recomposed ${scope}`;
+    const baseErrors = new Set(
+      validateGrid(baseGrid, { strict: true, projectType: pt, label }).errors,
+    );
+    const validation = validateGrid(proposed, {
+      strict: true,
+      projectType: pt,
+      label,
+    });
+    const newErrors = validation.errors.filter((e) => !baseErrors.has(e));
+    if (newErrors.length > 0) {
+      die(
+        `Recompose rejected by the strict validator:\n${newErrors.map((e) => `  - ${e}`).join("\n")}`,
+      );
+    }
+
+    // --- Apply the suffix flips ---------------------------------------------
+    for (const slug of skipList) content = setStageSuffix(content, slug, "SKIP");
+    for (const slug of addList) content = setStageSuffix(content, slug, "EXECUTE");
+
+    // --- Rebuild the derived fields against the EFFECTIVE plan --------------
+    // (the scope-change set: Stages to Execute / to Skip / Total / Completed).
+    const postSuffixes = parseStateStageSuffixes(content);
+    const eff = (slug: string): "EXECUTE" | "SKIP" => {
+      const v = postSuffixes.get(slug) ?? scopeDef.stages[slug];
+      return v === "EXECUTE" ? "EXECUTE" : "SKIP";
+    };
+    // The Stages to Skip row carries birth/scope-change annotations (entry
+    // shape "<number> (<slug>)", e.g. "2.1 (reverse-engineering — greenfield)")
+    // that a bare-slug rebuild would destroy. Preserve each existing entry
+    // VERBATIM, in its existing position, when its stage is still skipped;
+    // drop entries whose stage was promoted; append newly-skipped stages in
+    // graph order, rendered the way scope-change renders them. A skip+add
+    // round trip therefore leaves the row byte-identical.
+    const priorSkipRow = getField(content, "Stages to Skip") || "";
+    const priorTokens =
+      priorSkipRow.trim() === "" || priorSkipRow.trim() === "none"
+        ? []
+        : priorSkipRow.split(", ");
+    const slugOfSkipToken = (token: string): string => {
+      const m = /^\S+ \((.+)\)$/.exec(token);
+      const inner = m ? m[1] : token;
+      return inner.split(" — ")[0];
+    };
+    const executeStages: string[] = [];
+    const skipStages: string[] = [];
+    const preservedSlugs = new Set<string>();
+    for (const token of priorTokens) {
+      const slug = slugOfSkipToken(token);
+      if (knownSlugs.has(slug) && eff(slug) === "SKIP") {
+        skipStages.push(token);
+        preservedSlugs.add(slug);
+      }
+    }
+    for (const s of graph) {
+      if (eff(s.slug) === "EXECUTE") executeStages.push(s.number);
+      else if (!preservedSlugs.has(s.slug)) skipStages.push(`${s.number} (${s.slug})`);
+    }
+    content = setField(content, "Stages to Execute", executeStages.join(", "));
+    content = setField(content, "Stages to Skip", skipStages.length > 0 ? skipStages.join(", ") : "none");
+    content = setField(content, "Total Stages", String(executeStages.length));
+    const completedCount = parseCheckboxes(content).filter(
+      (c) => c.state === "completed" && eff(c.slug) === "EXECUTE",
+    ).length;
+    content = setField(content, "Completed", String(completedCount));
+    // The Next Stage projection over the recomposed plan (override-aware).
+    if (currentSlug) {
+      const next = nextInScopeStage(currentSlug, scope, content);
+      content = setField(content, "Next Stage", next ? next.slug : "none");
+    }
+    content = setField(content, "Last Updated", isoTimestamp());
+
+    writeStateFile(projectDir, content, flags.intent, flags.space);
+
+    appendAuditEvent(projectDir, "RECOMPOSED", {
+      Scope: scope,
+      "Stages skipped": skipList.length > 0 ? skipList.join(", ") : "none",
+      "Stages added": addList.length > 0 ? addList.join(", ") : "none",
+      "Stages in Scope": String(executeStages.length),
+    });
+
+    process.stdout.write(
+      `Recomposed: ${skipList.length} skipped (${skipList.join(", ") || "none"}), ` +
+        `${addList.length} added (${addList.join(", ") || "none"})\n` +
+        `Stages in scope: ${executeStages.length}\n` +
+        `Completed: ${completedCount}/${executeStages.length}\n`,
+    );
+  });
+}
+
+// ---------------------------------------------------------------------------
 // config-change — update depth and/or test-strategy without changing scope
 // ---------------------------------------------------------------------------
 
@@ -3037,37 +3347,6 @@ function handleSetStatus(projectDir: string, flags: Record<string, string>): voi
   writeStateFile(projectDir, content, flags.intent, flags.space);
 
   process.stdout.write(`${JSON.stringify({ updated: true, phase, stage, agent })}\n`);
-}
-
-// ---------------------------------------------------------------------------
-// enable-test-run — persist Test Run Mode flag in existing state file
-// ---------------------------------------------------------------------------
-
-function handleEnableTestRun(projectDir: string): void {
-  const sp = stateFilePath(projectDir);
-  if (!existsSync(sp)) die("No state file found. Start a workflow first by describing what to build (/aidlc \"build the auth service\").");
-
-  let content = readStateFile(projectDir);
-
-  // Already present — no-op
-  if (/\*\*Test Run Mode\*\*/.test(content)) {
-    process.stdout.write("Test Run Mode already set in state file.\n");
-    return;
-  }
-
-  // Insert after Revision Count line in Runtime State section
-  content = content.replace(
-    /^(- \*\*Revision Count\*\*:.*)$/m,
-    "$1\n- **Test Run Mode**: true"
-  );
-
-  writeStateFile(projectDir, content);
-
-  appendAuditEvent(projectDir, "TEST_RUN_MODE_ENABLED", {
-    Details: "Test Run Mode persisted to state file on resume",
-  });
-
-  process.stdout.write("Test Run Mode enabled in state file.\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -3427,6 +3706,12 @@ function main(): void {
     case "codekb-path":
       handleCodekbPath(projectDir, flags);
       break;
+    // detect - read-only query verb. Prints the workspace scan
+    // (greenfield/brownfield, languages) + the resolved scope-registry paths so
+    // the composer agent is told where scope data lives. No mutation, no audit.
+    case "detect":
+      handleDetect(projectDir, flags);
+      break;
     // init / state-init — deprecated aliases kept for back-compat only (not in
     // usage/help). The user-facing `/aidlc --init` is retired in P4: the
     // workspace shell ships in dist/ (SEED) and the engine auto-births the
@@ -3441,14 +3726,17 @@ function main(): void {
     case "scope-change":
       handleScopeChange(projectDir, flags);
       break;
+    // recompose - the adaptive composer's in-flight write: flip PENDING
+    // stages' plan suffixes (--skip/--add) under the audit lock, strict-
+    // validated, derived fields rebuilt, RECOMPOSED audited.
+    case "recompose":
+      handleRecompose(projectDir, flags);
+      break;
     case "config-change":
       handleConfigChange(projectDir, flags);
       break;
     case "set-status":
       handleSetStatus(projectDir, flags);
-      break;
-    case "enable-test-run":
-      handleEnableTestRun(projectDir);
       break;
     case "detect-scope":
       handleDetectScope(projectDir, flags);
@@ -3461,7 +3749,7 @@ function main(): void {
       break;
     default:
       die(
-        `Usage: aidlc-utility <help|version|status|doctor|intent-birth|intent|space|space-create|codekb-path|scope-change|config-change|set-status|enable-test-run|detect-scope|resolve-env-scope|scope-table> [--project-dir <path>] [--scope <scope>] [--json]`
+        `Usage: aidlc-utility <help|version|status|doctor|intent-birth|intent|space|space-create|codekb-path|detect|recompose|scope-change|config-change|set-status|detect-scope|resolve-env-scope|scope-table> [--project-dir <path>] [--scope <scope>] [--json]`
       );
   }
 }

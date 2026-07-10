@@ -8,14 +8,16 @@
 
 All event names follow `SUBJECT_PAST_VERB` — every event answers "what happened?"
 
-## Event Registry (67 events, 18 categories)
+## Event Registry (70 events, 18 categories)
 
-### Workflow Lifecycle (2 events)
+### Workflow Lifecycle (4 events)
 
 | Event | When | Required Fields | Emitter |
 |-------|------|-----------------|---------|
 | ✓ `WORKFLOW_STARTED` | Scope determined, workflow begins | Timestamp, Scope, Request | `tools/aidlc-utility.ts init` |
-| ✓ `WORKFLOW_COMPLETED` | All in-scope stages done, or test-run stop | Timestamp, Scope, Details, optional `Reason=test-run-stopped-at-<target>` | `tools/aidlc-state.ts complete-workflow`, `tools/aidlc-jump.ts execute --test-run` |
+| ✓ `WORKFLOW_COMPLETED` | All in-scope stages done | Timestamp, Scope, Details | `tools/aidlc-state.ts complete-workflow` |
+| ✓ `WORKFLOW_PARKED` | Workflow parked mid-flow for a later session (no stage advanced) | Stage, Timestamp | `tools/aidlc-state.ts park` |
+| ✓ `WORKFLOW_UNPARKED` | Park marker cleared on explicit `--resume` re-entry | Timestamp | `tools/aidlc-state.ts unpark` |
 
 ### Phase Lifecycle (4 events)
 
@@ -37,7 +39,7 @@ All event names follow `SUBJECT_PAST_VERB` — every event answers "what happene
 | `STAGE_JUMPED` | Forward/backward/redo jump target reached | Timestamp, Direction, Source, Target, Scope | `tools/aidlc-jump.ts execute` |
 | `STAGE_SKIPPED` | Stage skipped during jump (`[S]`) | Timestamp, Stage, Reason | `tools/aidlc-jump.ts execute`, `tools/aidlc-state.ts skip` |
 
-### Session Events (4 events — hook-owned, independent of workflow lifecycle)
+### Session Events (5 events — hook-owned, independent of workflow lifecycle)
 
 | Event | When | Required Fields | Emitter |
 |-------|------|-----------------|---------|
@@ -45,6 +47,7 @@ All event names follow `SUBJECT_PAST_VERB` — every event answers "what happene
 | `SESSION_RESUMED` | Existing Claude Code session resumed (source=resume) | Timestamp, Source | `hooks/aidlc-session-start.ts` |
 | `SESSION_COMPACTED` | Context compaction occurred | Timestamp, Current Stage, State Validity | `hooks/aidlc-validate-state.ts` (PreCompact) |
 | `SESSION_ENDED` | Claude Code session terminates | Timestamp, Reason | `hooks/aidlc-session-end.ts` |
+| `HUMAN_TURN` | A real human acted this turn: submitted a prompt or answered a question widget (the approval/interview gate requires one since the last gate resolution) | Timestamp | `hooks/aidlc-mint-presence.ts` (UserPromptSubmit + PostToolUse AskUserQuestion) + the per-harness prompt-submit adapters |
 
 ### Initialization Events (3 events — fire IN ADDITION TO `STAGE_COMPLETED`)
 
@@ -61,17 +64,17 @@ All event names follow `SUBJECT_PAST_VERB` — every event answers "what happene
 | `SCOPE_CHANGED` | `--scope` changed existing scope | Timestamp, Old scope, New scope | `tools/aidlc-utility.ts` |
 | `DEPTH_CHANGED` | `--depth` changed depth level | Timestamp, Old depth, New depth | `tools/aidlc-utility.ts` |
 | `TEST_STRATEGY_CHANGED` | `--test-strategy` changed test strategy | Timestamp, Old strategy, New strategy | `tools/aidlc-utility.ts` |
-| `TEST_RUN_MODE_ENABLED` | `--test-run` flag set | Timestamp, Details | `tools/aidlc-utility.ts` |
 | `SCOPE_DETECTED` | Auto-detected from freeform text | Timestamp, Detected scope, Input text, Source, Matched keywords (optional; present when `Source=keyword`) | `tools/aidlc-utility.ts detect-scope` |
+| `RECOMPOSED` | The adaptive composer re-shaped a running workflow's pending stages (suffix flips via `recompose`) | Timestamp, Scope, Stages skipped, Stages added, Stages in Scope | `tools/aidlc-utility.ts recompose` |
 
 ### Interaction Events (4 events)
 
 | Event | When | Required Fields | Emitter |
 |-------|------|-----------------|---------|
-| `DECISION_RECORDED` | Before presenting a structured question, to record the options shown | Timestamp, Stage, Decision, Options, optional `Test-Run=true` | `tools/aidlc-log.ts decision` |
-| `GATE_APPROVED` | Human approved at gate | Timestamp, Stage, User Input, optional `Test-Run=true` | `tools/aidlc-state.ts approve` |
+| `DECISION_RECORDED` | Before presenting a structured question, to record the options shown | Timestamp, Stage, Decision, Options | `tools/aidlc-log.ts decision` |
+| `GATE_APPROVED` | Human approved at gate | Timestamp, Stage, User Input | `tools/aidlc-state.ts approve` |
 | `GATE_REJECTED` | Human requested changes | Timestamp, Stage, Feedback | `tools/aidlc-state.ts reject` |
-| `QUESTION_ANSWERED` | Question answered by user | Timestamp, Stage, Details, optional `Test-Run=true` | `tools/aidlc-log.ts answer` |
+| `QUESTION_ANSWERED` | Question answered by user | Timestamp, Stage, Details | `tools/aidlc-log.ts answer` |
 
 ### Artifact Events (3 events — hook-emitted)
 
@@ -174,23 +177,17 @@ Emitted by stage-protocol §13 (Learnings Ritual). The runtime-graph compile emi
 
 ### Swarm (6 events)
 
-All six swarm events emit from the swarm referee `aidlc-swarm.ts` — the deterministic verdict surface the conductor consults. The referee is stateless (no iteration counter): `prepare` forks the per-unit worktrees and emits `SWARM_STARTED` (and `SWARM_DEGRADED` when the conductor reports a loud downgrade); `finalize` re-verifies the conductor's claimed-converged set, serialised-merges the genuine passes, and emits the per-Unit pair (`SWARM_UNIT_CONVERGED` / `SWARM_UNIT_FAILED`), the per-failed-Unit baton row (`SWARM_BATON_RETURNED`), and the batch tally (`SWARM_COMPLETED`). The `check` subcommand emits nothing — it is an advisory verdict that informs the conductor's retry decision. The engine is read-only and the conductor never emits audit events, so the deterministic tool owns the whole swarm taxonomy. Because the loop and its cap live in the driver (the ultracode script's `for`-bound or the subagent floor's harness ceiling), not in the referee, the per-Unit rows carry no `Iterations` / `Cap value` fields — there is no counter to record.
+All six swarm events emit from the swarm referee `aidlc-swarm.ts` — the deterministic verdict surface the conductor consults. The referee is stateless (no iteration counter): `prepare` forks the per-unit worktrees and emits `SWARM_STARTED` (and `SWARM_DEGRADED` when the conductor reports a loud downgrade); `finalize` re-verifies the conductor's claimed-converged set, serialised-merges the genuine passes, and emits the per-Unit pair (`SWARM_UNIT_CONVERGED` / `SWARM_UNIT_FAILED` — except a converged unit whose merge-back failed, which gets neither row until a finalize retry merges it), the per-failed-Unit baton row (`SWARM_BATON_RETURNED`), and the batch tally (`SWARM_COMPLETED`). The `check` subcommand emits nothing — it is an advisory verdict that informs the conductor's retry decision. The engine is read-only and the conductor never emits audit events, so the deterministic tool owns the whole swarm taxonomy. Because the loop and its cap live in the driver (the ultracode script's `for`-bound or the subagent floor's harness ceiling), not in the referee, the per-Unit rows carry no `Iterations` / `Cap value` fields — there is no counter to record.
 
 | Event | When | Required Fields | Emitter |
 |-------|------|-----------------|---------|
 | `SWARM_STARTED` | Swarm referee `prepare` forked a batch of dependency-linked Units | Timestamp, Batch number, Unit names, Concurrency cap | `tools/aidlc-swarm.ts` |
-| `SWARM_UNIT_CONVERGED` | A swarm Unit re-verified green (and untampered) at the `finalize` gate | Timestamp, Batch number, Unit name | `tools/aidlc-swarm.ts` |
+| `SWARM_UNIT_CONVERGED` | A swarm Unit re-verified green (and untampered) at the `finalize` gate AND its merge-back landed (a converged unit in `merge_failures` gets no row until a finalize retry merges it) | Timestamp, Batch number, Unit name | `tools/aidlc-swarm.ts` |
 | `SWARM_UNIT_FAILED` | A swarm Unit failed the `finalize` re-verify (not claimed, claimed-but-red, or tampered) | Timestamp, Batch number, Unit name, Reason | `tools/aidlc-swarm.ts` |
 <!-- Reason for a CLAIMED-but-red / tampered unit is always the tool's own verdict (`error`); for a DECLINED (unclaimed) unit it is the conductor's typed attribution via `finalize --reasons` (`unsatisfiable` / `budget-exhausted` / `cap-exhausted`, defaulting to `cap-exhausted`) — the tool records the conductor's knowledge call, it does not judge unsatisfiability itself (D-I). -->
 | `SWARM_BATON_RETURNED` | A swarm Unit returned the baton to the conductor for orchestrator-mediated coordination | Timestamp, Batch number, Unit name, Reason | `tools/aidlc-swarm.ts` |
 | `SWARM_COMPLETED` | All Units in the batch finished (converged or failed); batch closed | Timestamp, Batch number, Converged count, Failed count | `tools/aidlc-swarm.ts` |
 | `SWARM_DEGRADED` | `AIDLC_USE_SWARM=1` was requested but the Workflow tool was unavailable, so the conductor ran the subagent floor (loud-degrade) | Timestamp, Batch number, Requested driver, Fallback driver | `tools/aidlc-swarm.ts` |
-
-## Test-Run Mode
-
-`--test-run` is a CI/test-framework flag. It runs a scope end-to-end without interactive prompts for automated orchestrator testing. Under `--test-run`, interaction events (`GATE_APPROVED`, `QUESTION_ANSWERED`, `DECISION_RECORDED`) fire with an extra `Test-Run=true` field so downstream tooling can filter. No separate auto-variant events exist.
-
-When `--test-run` is combined with `--stage` or `--phase` and the target is reached, the workflow terminates via `WORKFLOW_COMPLETED` with `Reason=test-run-stopped-at-<target>`.
 
 ## Hook-Generated Format
 

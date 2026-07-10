@@ -15,7 +15,7 @@ import {
   worktreePath,
 } from "./aidlc-lib.ts";
 
-// --- Canonical event types (67) ---
+// --- Canonical event types (70) ---
 // See docs/reference/12-state-machine.md for the state transitions that emit each event.
 
 const VALID_EVENT_TYPES = new Set([
@@ -34,11 +34,17 @@ const VALID_EVENT_TYPES = new Set([
   // Workflow lifecycle
   "WORKFLOW_STARTED",
   "WORKFLOW_COMPLETED",
+  "WORKFLOW_PARKED",
+  "WORKFLOW_UNPARKED",
   // Session events (hook-owned)
   "SESSION_STARTED",
   "SESSION_RESUMED",
   "SESSION_COMPACTED",
   "SESSION_ENDED",
+  // Human presence (hook-owned): one event per real human prompt turn. The
+  // approval/interview gate requires a HUMAN_TURN appended AFTER the last gate
+  // resolution (in ledger order) before it commits.
+  "HUMAN_TURN",
   // Initialization events (fire IN ADDITION TO STAGE_COMPLETED)
   "WORKSPACE_SCAFFOLDED",
   "WORKSPACE_SCANNED",
@@ -60,7 +66,9 @@ const VALID_EVENT_TYPES = new Set([
   "SCOPE_CHANGED",
   "DEPTH_CHANGED",
   "TEST_STRATEGY_CHANGED",
-  "TEST_RUN_MODE_ENABLED",
+  // Adaptive composer: an in-flight plan re-shape (pending-stage suffix flips
+  // via the recompose verb). Emitted by aidlc-utility.ts handleRecompose.
+  "RECOMPOSED",
   // Jump events owned by STAGE_JUMPED — JUMP_COMPLETED was deleted as a
   // redundant alias.
   // Error/Recovery
@@ -129,10 +137,13 @@ const EVENT_HEADINGS: Record<string, string> = {
   PHASE_SKIPPED: "Phase Skip",
   WORKFLOW_STARTED: "Workflow Start",
   WORKFLOW_COMPLETED: "Workflow Completion",
+  WORKFLOW_PARKED: "Workflow Parked",
+  WORKFLOW_UNPARKED: "Workflow Unparked",
   SESSION_STARTED: "Session Start",
   SESSION_RESUMED: "Session Resume",
   SESSION_COMPACTED: "Session Compacted",
   SESSION_ENDED: "Session End",
+  HUMAN_TURN: "Human Turn",
   WORKSPACE_SCAFFOLDED: "Workspace Scaffolded",
   WORKSPACE_SCANNED: "Workspace Scanned",
   WORKSPACE_INITIALISED: "Workspace Initialised",
@@ -149,7 +160,7 @@ const EVENT_HEADINGS: Record<string, string> = {
   SCOPE_CHANGED: "Scope Change",
   DEPTH_CHANGED: "Depth Change",
   TEST_STRATEGY_CHANGED: "Test Strategy Change",
-  TEST_RUN_MODE_ENABLED: "Test-Run Mode Enabled",
+  RECOMPOSED: "Plan Recomposed",
   ERROR_LOGGED: "Error Logged",
   RECOVERY_COMPLETED: "Recovery Completed",
   BOLT_STARTED: "Bolt Started",

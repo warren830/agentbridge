@@ -54,6 +54,7 @@ copies this table verbatim.
 | `support_agents` | string[] | yes | empty list allowed; each entry a valid agent slug. Renamed from prose `Supporting Agents:` (format-only rename) |
 | `mode` | string | yes | `inline` \| `subagent` \| `agent-team`. `inline` and `subagent` are active; **`agent-team` is reserved** — no stage declares it until a consumer ships. Orchestrator code reading `mode` MUST handle `agent-team` explicitly (at minimum throw "not yet implemented") — do not fall through to a default path |
 | `for_each` | string | optional | artifact slug; stage runs once per instance of that artifact. Omit for once-per-workflow stages. Doctor validates the artifact is produced by an upstream stage |
+| `workspace_requires` | boolean | optional | Default `false`. `true` marks a stage that must write source code to the workspace root, not just planning docs under the per-intent record dir. The stage-completion artifact guard (`aidlc-state.ts` approve/advance/finalize/complete-workflow) then requires a file outside the `aidlc/` workspace tree and the harness dir before the stage can complete: a stage that wrote only its `produces[]` markdown but no code is refused. Today only `code-generation` declares it |
 | `produces` | string[] | yes | empty allowed; lowercase-kebab artifact names — see [Artifact Vocabulary](../../../../docs/reference/16-artifact-vocabulary.md) for rules and the live registry tool |
 | `consumes` | object[] | yes | empty allowed; each entry `{artifact, required, conditional_on?}` |
 | `consumes[].artifact` | string | yes per entry | lowercase-kebab |
@@ -135,6 +136,17 @@ root** — the `outputs:` frontmatter and any "Create `…/…`" prose are
 human-facing documentation only; the engine hands the conductor the resolved
 `produces[]` path. Treat a rooted path literal in a stage file as a doc bug, not
 a behavior contract.
+
+The same emit-time resolution splits the consumed inputs by presence: the
+directive's `consumes` lists only resolved paths that exist on disk, and any
+REQUIRED declared input whose file is absent moves to `consumes_absent`,
+annotated `expected: true` when the producing stage is off the active scope's
+path (the scope deliberately skipped it — see `consumes[].required` above) or
+`expected: false` when a producer is on the path but the file is still
+missing. A `required: false` consume that is absent is simply dropped — an
+optional input that does not exist is not an input, never a gap. The
+conductor is never pointed at a path that cannot be read; absence-by-design
+arrives as data, not as a failed read.
 
 ---
 

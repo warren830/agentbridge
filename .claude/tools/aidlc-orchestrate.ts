@@ -76,15 +76,18 @@ import {
   type ErrorDirective,
   GATE_UNRESOLVED,
   type GateValue,
+  type ParkedDirective,
   type PrintDirective,
   type RunStageDirective,
   validateDirective,
 } from "./aidlc-directive.ts";
 import {
   activeSpace,
+  auditBlockField,
   type CheckboxLine,
   codekbRepoName,
   errorMessage,
+  findAllEvents,
   firstInScopeStageOfPhase,
   getField,
   intentRepos,
@@ -94,6 +97,7 @@ import {
   PHASE_NUMBERS,
   PHASES,
   READ_ONLY_FLAGS,
+  readAllAuditShards,
   relativeCodekbDir,
   relativeRecordDir,
   relativeSpaceRecordPrefix,
@@ -112,6 +116,12 @@ import {
   producersOf,
   subgraphForScope,
 } from "./aidlc-graph.ts";
+// inferScopeFromText is a PURE function (keyword matching over the scope
+// registry) - importing it keeps `next` read-only. The audit-emitting
+// detect-scope verb remains the conductor's separate recording move; the
+// import is safe (aidlc-utility.ts main() runs only under import.meta.main,
+// and utility never imports this module - no cycle).
+import { inferScopeFromText } from "./aidlc-utility.ts";
 
 // Read the workflow state file if it exists, else null. The engine's `next` is
 // a pure read: an absent state file is a legitimate branch (no workflow yet),
@@ -230,6 +240,13 @@ function errorDirective(message: string): ErrorDirective {
   return { kind: "error", message };
 }
 
+// parked - the terminal directive a parked workflow emits (issue #367). Carries
+// the slug it parked at; the Stop hook treats `parked` as a terminal allow so
+// the conductor can end its turn at a clean inter-stage boundary.
+function parkedDirective(reason: string, stage: string): ParkedDirective {
+  return { kind: "parked", reason, stage };
+}
+
 // --- Flag parsing ---
 
 interface ParsedFlags {
@@ -240,21 +257,33 @@ interface ParsedFlags {
   testStrategy?: string;
   readOnly?: string; // the matched read-only flag, if any
   resume?: boolean; // --resume: re-enter an existing workflow (resume choice)
-  testRun?: boolean; // --test-run: CI/automation mode (rides through to a jump's execute)
   single?: boolean; // --single: run ONE stage under a synthetic workflow id, never touching the main pointer
   newIntent?: boolean; // --new-intent: the conductor confirmed new-work alongside an active intent → emit the SAME birth directive (with the --label seam) the fresh-start path uses, instead of constructing intent-birth from SKILL.md prose
   intent?: string; // freeform request text (no leading --flag)
   workspaceVerb?: { verb: string; arg?: string }; // leading workspace verb (space/space-create/intent) + optional <name> arg
+  compose?: boolean; // leading `compose` verb: force the composer (front or in-flight)
+  newScope?: boolean; // --new-scope: force the composer to SYNTHESIZE a custom scope even when a stock scope matches
+  report?: string; // --report <path>: compose from a scan report (the composer triages the file)
   projectDir?: string;
 }
 
 // Extract the flags the `next` decision rule consumes. --project-dir is pulled
 // out by the caller before this runs; here we read scope/stage/phase/depth/
-// test-strategy, the boolean mode flags (--resume/--test-run/--single), and detect a
+// test-strategy, the boolean mode flags (--resume/--single), and detect a
 // read-only utility flag. Any leading non-flag token is the freeform intent
 // (mirrors `/aidlc <freeform description>`). Mirrors the prose orchestrator's
 // flag extraction — the value of a valued flag is the following argv token.
 function parseNextFlags(args: string[]): ParsedFlags {
+  // A SOLE bare `help` / `-h` token is a help REQUEST, not intent text. Without
+  // this, the token falls into intentWords and the freeform funnel offers to
+  // birth an intent literally named "help" (fresh workspace) or silently
+  // advances the active stage (live workflow). Sole-token only: `help` inside a
+  // longer description ("help me build auth") stays freeform intent text.
+  // PARITY: classifyTerminalCommand (aidlc-lib.ts) mirrors this rule - the Kiro
+  // verb-intercept seam and the engine must never disagree on what is terminal.
+  if (args.length === 1 && (args[0] === "help" || args[0] === "-h")) {
+    return { readOnly: "--help" };
+  }
   const flags: ParsedFlags = {};
   const intentWords: string[] = [];
   for (let i = 0; i < args.length; i++) {
@@ -272,14 +301,37 @@ function parseNextFlags(args: string[]): ParsedFlags {
     if (i === 0 && WORKSPACE_VERBS.has(a)) {
       const next = args[i + 1];
       const arg = next !== undefined && !next.startsWith("--") ? next : undefined;
+      // `intent help`/`-h` / `space help`/`-h` is a help REQUEST, not a switch
+      // to a record named "help": no per-verb help exists, and the failed
+      // switch would die with an error whose recovery text steers the
+      // conductor into birthing an intent ("help" is also a reserved record
+      // name - RESERVED_RECORD_NAMES - so no real record is shadowed). Route
+      // it to the global help print. space-create is excluded: its handler
+      // refuses a help-shaped name itself with an actionable error (the
+      // reserved-name guard alone would miss "-h", which slugifies to "h").
+      // PARITY: classifyTerminalCommand (aidlc-lib.ts) mirrors this rule.
+      if ((a === "intent" || a === "space") && (arg === "help" || arg === "-h")) {
+        return { readOnly: "--help" };
+      }
       flags.workspaceVerb = arg !== undefined ? { verb: a, arg } : { verb: a };
       if (arg !== undefined) i++;
       continue;
     }
+    // A LEADING `compose` verb forces the composer (front on a fresh workspace,
+    // in-flight recompose over an active one). DELIBERATELY its own check, NOT a
+    // WORKSPACE_VERBS entry: that set feeds classifyTerminalCommand, which the
+    // Kiro verb-intercept hook runs OFF-BAND as a terminal aidlc-utility
+    // subcommand (and arms the roll-forward latch) - compose is workflow work
+    // the conductor must dispatch, never a terminal utility. Only the FIRST
+    // positional token counts, so freeform prose containing "compose"
+    // mid-sentence stays intent text. Any text after the verb is the compose
+    // request (falls through to intentWords).
+    if (i === 0 && a === "compose") {
+      flags.compose = true;
+      continue;
+    }
     if (a === "--resume") {
       flags.resume = true;
-    } else if (a === "--test-run") {
-      flags.testRun = true;
     } else if (a === "--single") {
       flags.single = true;
     } else if (a === "--new-intent") {
@@ -298,6 +350,13 @@ function parseNextFlags(args: string[]): ParsedFlags {
       i++;
     } else if (a === "--test-strategy" && i + 1 < args.length) {
       flags.testStrategy = args[i + 1];
+      i++;
+    } else if (a === "--new-scope") {
+      flags.newScope = true;
+    } else if (a === "--report" && i + 1 < args.length) {
+      // CONSUME the value: an unrecognized valued flag would leak its value
+      // into the freeform intent text (the path would read as intent words).
+      flags.report = args[i + 1];
       i++;
     } else if (!a.startsWith("--")) {
       intentWords.push(a);
@@ -320,7 +379,7 @@ function parseNextFlags(args: string[]): ParsedFlags {
 // deterministic tool mutates, the human's "start a new intent?" judgement gated
 // the get-here. Threads the freeform feature description (--arguments) so the
 // born intent's slug + state Project field carry it, plus --depth /
-// --test-strategy / --test-run. Shared by Branch 7b (valid-scope positional) and
+// --test-strategy. Shared by Branch 7b (valid-scope positional) and
 // Branch 9 (explicit --scope flag) so the explicit-naming shapes emit identical
 // directives. The harness dir is resolved through harnessDir() so the directive
 // names the right tree on every harness (.claude/.kiro/.codex).
@@ -340,10 +399,58 @@ function birthPrintDirective(scope: string, flags: ParsedFlags, description?: st
   }
   if (flags.depth) cmd.push(`--depth ${flags.depth}`);
   if (flags.testStrategy) cmd.push(`--test-strategy ${flags.testStrategy}`);
-  if (flags.testRun) cmd.push("--test-run");
   return printDirective(
     `Run \`bun ${harnessDir()}/tools/aidlc-utility.ts ${cmd.join(" ")}\` to start the workflow, then re-run \`next\` to continue.${labelHint}`,
   );
+}
+
+// The composer-dispatch print for a compose request (the adaptive-workflows
+// composer). The engine stays read-only: it NAMES the dispatch move (the
+// conductor Tasks the composer agent, renders the proposal, and holds the
+// approve/edit/reject gate); it never dispatches or writes itself. Two modes:
+//   - front (no state file): compose a scope from the prompt (or a scan
+//     report) BEFORE birth. The composer proposes; on approval the conductor
+//     continues into the normal intent-birth with the chosen scope.
+//   - in-flight (state file present): re-shape the RUNNING workflow's pending
+//     stages (SKIP / un-SKIP), which lands as suffix flips via the recompose
+//     verb - never a silent advance of the current stage.
+// The message threads the compose inputs (task text, --new-scope, --report)
+// so the conductor forwards them to the composer verbatim.
+function composeDispatchDirective(
+  flags: ParsedFlags,
+  inFlight: boolean,
+): PrintDirective {
+  const hd = harnessDir();
+  const parts: string[] = [];
+  if (inFlight) {
+    parts.push(
+      `Dispatch the composer agent (${hd}/agents/aidlc-composer-agent.md) as a subagent to propose re-shaping the RUNNING workflow's pending stages` +
+        (flags.intent ? ` for: "${flags.intent}".` : "."),
+      "The composer reads the live state file's Stage Progress and proposes SKIP/un-SKIP flips for PENDING, ahead-of-cursor stages only (completed [x], in-progress [-], and skipped [S] stages are frozen).",
+      "BEFORE presenting the gate, write the pending-proposal marker `aidlc/.aidlc-compose-pending` (any content) so the turn can end at the gate; on approve run `bun " +
+        hd +
+        "/tools/aidlc-utility.ts recompose --skip <slugs> --add <slugs>` (comma-separated) and DELETE the marker; on reject/edit-then-resolve delete the marker too.",
+    );
+  } else {
+    parts.push(
+      `Dispatch the composer agent (${hd}/agents/aidlc-composer-agent.md) as a subagent to propose the workflow plan for: "${flags.intent ?? ""}".`,
+    );
+    if (flags.report) {
+      parts.push(
+        `First have it read and triage the scan report at "${flags.report}" (auto-fixable vs human-decision findings), then compose a compact fix-and-ship grid - this often routes to the stock bugfix or security-patch scope rather than minting a new one.`,
+      );
+    }
+    if (flags.newScope) {
+      parts.push(
+        "--new-scope was passed: the composer must SYNTHESIZE a custom scope even if a stock scope matches.",
+      );
+    }
+  }
+  parts.push(
+    `The composer runs \`bun ${hd}/tools/aidlc-utility.ts detect --json\` (read-only scan + scope-registry paths) and reads the scope definitions under ${hd}/scopes/, then returns a structured proposal (mode matched|custom, scopeName, the per-stage EXECUTE/SKIP grid, and a per-SKIP rationale).`,
+    "Render the proposal to the human and present the approve/edit/reject gate (see the composer block in SKILL.md). Do NOT write any file and do NOT advance any stage before an explicit approval.",
+  );
+  return printDirective(parts.join(" "));
 }
 
 // Guard the birth gate against a DUPLICATE intent on a fresh clone of a
@@ -597,6 +704,53 @@ function readBoltDagBatches(projectDir: string): string[][] | null {
   return null;
 }
 
+// The set of Units of Work the swarm referee has recorded as CONVERGED for the
+// active intent, read from the audit ledger. This is the swarm's completion
+// signal, NOT on-disk artifact presence. A swarm unit builds inside an isolated
+// Bolt worktree and `aidlc-bolt complete --merge` consolidates only the AIDLC
+// metadata (state + audit + runtime-graph fragment) back to the main checkout;
+// the unit's produced artifacts (code-generation-plan.md / code-summary.md and
+// the generated source) are NOT copied into the main record tree by the swarm
+// finalize flow. So unitCovered's disk check (the INLINE per-unit ledger) never
+// sees a swarm unit as covered, and the batch-advance signal must instead be the
+// `SWARM_UNIT_CONVERGED` audit rows `aidlc-swarm.ts finalize` writes from the
+// main checkout, one per genuinely-converged unit, each carrying `Unit name`.
+// Composes the same shard-concat + block-parse the other audit readers use; an
+// absent/empty audit yields the empty set (no batch has converged yet).
+//
+// The read is FLOORED at the stage's latest STAGE_STARTED row. The audit is
+// append-only and per-intent, and the stage CAN legitimately re-run within the
+// same intent with the same unit names: a backward/redo jump resets completed
+// stages to pending without touching the ledger (and without clearing the
+// autonomy grant), and a re-init appends a second WORKFLOW_STARTED to the same
+// shards. Without the floor, the prior run's converged rows would make the
+// fresh run's batches look already built and the rebuild would be silently
+// skipped. Every (re-)entry into the stage lands a fresh STAGE_STARTED naming
+// the slug (advance and jump both emit it), and no STAGE_STARTED fires between
+// batches of one run, so the floor admits exactly the current run's rows.
+// Mirrors hasStageAuditEvent's boundary idiom (aidlc-state.ts): rows from a
+// `--single` stage-runner carry `Workflow: single-stage:<slug>` and never move
+// the floor; with no qualifying STAGE_STARTED the floor degrades to "count all
+// rows", never to "exclude all".
+function swarmConvergedUnits(projectDir: string, slug: string): Set<string> {
+  const audit = readAllAuditShards(projectDir);
+  if (!audit) return new Set();
+  let since = "";
+  for (const ev of findAllEvents(audit, "STAGE_STARTED")) {
+    if (auditBlockField(ev.block, "Workflow")?.startsWith("single-stage:")) continue;
+    if (auditBlockField(ev.block, "Stage") !== slug) continue;
+    // findAllEvents returns chronological order; keep the latest.
+    since = ev.timestamp;
+  }
+  const converged = new Set<string>();
+  for (const { timestamp, block } of findAllEvents(audit, "SWARM_UNIT_CONVERGED")) {
+    if (since && timestamp < since) continue;
+    const unit = auditBlockField(block, "Unit name");
+    if (unit) converged.add(unit);
+  }
+  return converged;
+}
+
 // True when `node` is the SKELETON-GATE stage for `scope` — the FIRST
 // Construction EXECUTE stage in scope (the start of Bolt 1). This is derived,
 // not hardcoded: firstInScopeStageOfPhase("construction", scope) walks the
@@ -729,6 +883,14 @@ function isCodekb(node: GraphStage): boolean {
 // defaults) the codekb branch never fires and the record-dir path stands.
 type CodekbCtx = { projectDir: string; space: string; codekbRepo: string };
 
+// Build the CodekbCtx for a live projectDir, resolving the active-space cursor
+// and the deterministic codekb repo name (both read-only). One place so the
+// `next` happy path, the jump paths, and the report-side per-unit coverage guard
+// share the same construction instead of repeating the object literal.
+function codekbCtxFor(pd: string): CodekbCtx {
+  return { projectDir: pd, space: activeSpace(pd), codekbRepo: codekbRepoName(pd) };
+}
+
 // Resolve a single artifact vocabulary name to its canonical aidlc-docs/... path
 // UNDER THE STAGE THAT OWNS THE FILE. Non-per-unit stages map to
 // `aidlc-docs/<phase>/<stage-slug>/<name>.md`; per-unit Construction stages
@@ -815,6 +977,12 @@ function projectTypeFrom(
 // resolveConsumePath): the filter decides WHICH consumes appear; the producer
 // lookup decides WHERE each one lives. `node` is passed only for the orphan
 // fallback, not as the resolution key.
+// A resolved consume: the artifact NAME and required flag carried alongside
+// the resolved path, so the presence split downstream can key producer lookups
+// and required-ness off the authored vocabulary instead of re-deriving the
+// name from the path shape.
+type ResolvedConsume = { artifact: string; required: boolean; path: string };
+
 function resolveConsumes(
   consumes: Consume[],
   node: GraphStage,
@@ -822,8 +990,8 @@ function resolveConsumes(
   unit: string,
   recordPrefix: string | null,
   codekbCtx?: CodekbCtx,
-): string[] {
-  const paths: string[] = [];
+): ResolvedConsume[] {
+  const resolved: ResolvedConsume[] = [];
   for (const consume of consumes) {
     if (
       consume.conditional_on &&
@@ -832,9 +1000,60 @@ function resolveConsumes(
     ) {
       continue;
     }
-    paths.push(resolveConsumePath(consume.artifact, node, unit, recordPrefix, codekbCtx));
+    resolved.push({
+      artifact: consume.artifact,
+      required: consume.required,
+      path: resolveConsumePath(consume.artifact, node, unit, recordPrefix, codekbCtx),
+    });
   }
-  return paths;
+  return resolved;
+}
+
+// Split resolved consumes into PRESENT (file exists on disk) and ABSENT
+// (it does not), so the directive never points the conductor at a path that
+// cannot be read. Only REQUIRED absent consumes are reported: an optional
+// (`required: false`) input that does not exist simply is not an input — it
+// is dropped from the directive entirely, never flagged as a gap. Each
+// required absent entry is annotated: `expected: true` when no producer of
+// the artifact is on the active scope's path (the scope deliberately skipped
+// the producer — the lean scopes' designed shortcut, so absence is by
+// design), `expected: false` when a producer IS on the path but the file is
+// still missing (a runtime-skipped conditional producer, or a real gap the
+// recovery protocol owns).
+//
+// Existence resolves like unitCovered: the resolved paths are
+// workspace-RELATIVE with forward slashes, re-rooted absolutely under
+// codekbCtx.projectDir (splitting on "/" so the join is OS-correct). Two
+// deliberate skips keep the split total:
+//   - no codekbCtx (the ctx-less test/default path) → no absolute base to
+//     check against; everything stays in `consumes`, exactly as before.
+//   - a path still carrying the {unit-name} placeholder → existence is
+//     unknowable pre-Bolt; it stays in `consumes`.
+function splitConsumesByPresence(
+  consumes: ResolvedConsume[],
+  scope: string,
+  codekbCtx?: CodekbCtx,
+): { present: string[]; absent: Array<{ path: string; expected: boolean }> } {
+  if (!codekbCtx) return { present: consumes.map((c) => c.path), absent: [] };
+  const onPath = new Set(subgraphForScope(scope).map((s) => s.slug));
+  const present: string[] = [];
+  const absent: Array<{ path: string; expected: boolean }> = [];
+  for (const c of consumes) {
+    if (c.path.includes(UNIT_NAME_PLACEHOLDER)) {
+      present.push(c.path);
+      continue;
+    }
+    const abs = join(codekbCtx.projectDir, ...c.path.split("/"));
+    if (existsSync(abs)) {
+      present.push(c.path);
+      continue;
+    }
+    if (!c.required) continue; // optional + missing → not an input, not a gap
+    const producers = producersOf(c.artifact);
+    const producerOnPath = producers.some((p) => onPath.has(p.slug));
+    absent.push({ path: c.path, expected: !producerOnPath });
+  }
+  return { present, absent };
 }
 
 // Resolve a node's produces[] (always bare names, even for per-unit stages) to
@@ -903,6 +1122,10 @@ function buildRunStageDirective(
   recordPrefix: string | null = null,
   codekbCtx?: CodekbCtx,
 ): RunStageDirective {
+  const resolvedConsumes = resolveConsumes(
+    node.consumes ?? [], node, projectType, unit, recordPrefix, codekbCtx,
+  );
+  const { present, absent } = splitConsumesByPresence(resolvedConsumes, scope, codekbCtx);
   const directive: RunStageDirective = {
     kind: "run-stage",
     stage: node.slug,
@@ -916,12 +1139,24 @@ function buildRunStageDirective(
     mode: node.mode as RunStageDirective["mode"],
     gate: computeGate(node, scope, stateContent),
     memory_path: memoryPathFor(node.phase, node.slug, recordPrefix),
-    consumes: resolveConsumes(node.consumes ?? [], node, projectType, unit, recordPrefix, codekbCtx),
+    consumes: present,
     produces: resolveProduces(node, unit, recordPrefix, codekbCtx),
     rules_in_context: (node.rules_in_context ?? []).map((r) => r.path),
     sensors_applicable: (node.sensors_applicable ?? []).map((s) => s.id),
     stage_file: stageFileFor(node.phase, node.slug),
   };
+  if (absent.length > 0) directive.consumes_absent = absent;
+  // next_stage: the display name of the in-scope stage that follows this one, so
+  // the approval gate's Approve option reads "Continue to <next_stage>" verbatim
+  // instead of a guessed constant. Computed here at emit time: the gate is
+  // presented and answered within the same forwarding beat, and any recompose
+  // between emit and approval re-runs `next`, which re-emits with a fresh value.
+  // nextInScopeStage honours the state file's EXECUTE/SKIP overrides + prior
+  // [x]/[S] checkboxes, the same walk the post-approval advance uses, so the
+  // named stage is the one the workflow will actually run next. null = this is
+  // the final in-scope stage (the conductor renders "Complete workflow").
+  const nextStage = nextInScopeStage(node.slug, scope, stateContent ?? undefined);
+  directive.next_stage = nextStage ? nextStage.name : null;
   // Reviewer — include if the stage declares one (§12a).
   if (node.reviewer) {
     directive.reviewer = node.reviewer;
@@ -962,7 +1197,7 @@ function handleNext(args: string[], projectDir: string | undefined): void {
   // open to the normal `next`.
   if (!flags.readOnly && !flags.workspaceVerb && !flags.stage && !flags.phase &&
       !flags.scope && !flags.intent && !flags.resume && !flags.depth && !flags.testStrategy &&
-      !flags.single && !flags.testRun) {
+      !flags.single && !flags.compose && !flags.newScope && !flags.report) {
     try {
       const pdLatch = resolveProjectDir(projectDir);
       const latchPath = join(pdLatch, "aidlc", ".aidlc-readonly-latch");
@@ -1059,11 +1294,58 @@ function handleNext(args: string[], projectDir: string | undefined): void {
   // place a KNOWN_CODEKB_STAGES artifact under aidlc/spaces/<space>/codekb/
   // <repo>/ (dropping the intents/<slug> tail) without re-reading the disk in
   // the pure resolver. codekbRepoName is read-only (intentRepos never throws).
-  const codekbCtx: CodekbCtx = {
-    projectDir: pd,
-    space: activeSpace(pd),
-    codekbRepo: codekbRepoName(pd),
-  };
+  const codekbCtx = codekbCtxFor(pd);
+
+  // Branch 2.5 - PARKED workflow (issue #367). The `park` subcommand persists a
+  // `Parked` runtime field (via aidlc-state.ts park) without advancing any
+  // stage; on a PLAIN `next` (no explicit re-entry flag) the engine emits a
+  // terminal `parked` directive that the Stop hook honours as a clean turn-end,
+  // so a long workflow can pause across sessions instead of rubber-stamping the
+  // remaining stages to reach `done`. Two self-disabling conditions keep this
+  // narrow:
+  //   1. SELF-DISABLE on explicit re-entry - a `--resume` / `--stage` / `--phase`
+  //      next is a deliberate continuation, handled by the unpark branch below
+  //      (resume) or the jump path (stage/phase), so it never re-emits `parked`.
+  //   2. STALE-BY-PROGRESS - only emit `parked` while `Parked At Stage` still
+  //      equals `Current Stage`. If the workflow has advanced past the parked
+  //      slug (a stale marker), ignore it and fall through to the normal route.
+  if (
+    stateContent &&
+    !flags.resume &&
+    !flags.stage &&
+    !flags.phase &&
+    (getField(stateContent, "Parked") ?? "").trim().length > 0
+  ) {
+    const parkedAt = (getField(stateContent, "Parked At Stage") ?? "").trim();
+    const currentSlug = (getField(stateContent, "Current Stage") ?? "").trim();
+    if (parkedAt.length > 0 && parkedAt === currentSlug) {
+      emit(parkedDirective(
+        `Workflow parked at "${parkedAt}". Resume with /aidlc --resume.`,
+        parkedAt,
+      ));
+      return;
+    }
+  }
+
+  // Branch 2.6 - unpark on RESUME (issue #367). A `--resume` over a parked
+  // workflow must CLEAR the marker before continuing, else the next plain `next`
+  // would re-park. Clearing is a MUTATION, so `next` NAMES the move (a
+  // run-then-continue print) and the conductor runs the tool; `next` itself
+  // writes nothing. Fires before Branch 6 (the resume-choice ask) so the marker
+  // is cleared first.
+  if (
+    stateContent &&
+    flags.resume &&
+    !flags.stage &&
+    !flags.phase &&
+    (getField(stateContent, "Parked") ?? "").trim().length > 0
+  ) {
+    emit(printDirective(
+      `This workflow is parked. Run \`bun ${harnessDir()}/tools/aidlc-state.ts unpark\` ` +
+        "to clear the park marker, then re-run `next --resume` to continue.",
+    ));
+    return;
+  }
 
   // (Branch 3 — the legacy `--init` flag — retired in P4. There is no longer a
   // user-facing `/aidlc --init`: the workspace shell ships in dist/ (SEED) and
@@ -1114,6 +1396,30 @@ function handleNext(args: string[], projectDir: string | undefined): void {
   if (!validScopes().has(scope)) {
     const valid = [...validScopes()].join(", ");
     emit(errorDirective(`Unknown scope "${scope}". Valid scopes: ${valid}.`));
+    return;
+  }
+
+  // Branch 4c - the COMPOSE surfaces (adaptive workflows). A leading `compose`
+  // verb, `--new-scope`, or `--report <path>` each force the composer; the
+  // engine NAMES the dispatch (print) and stays read-only. Deliberately NOT a
+  // WORKSPACE_VERBS/classifyTerminalCommand entry (that would make the Kiro
+  // verb-intercept hook run `compose` off-band as a terminal aidlc-utility
+  // subcommand and arm the roll-forward latch - compose is workflow work the
+  // conductor dispatches). Two modes split on the state file: no state = the
+  // FRONT composer (propose a scope before birth); state present = the
+  // IN-FLIGHT composer (propose pending-stage flips over the running
+  // workflow), which is what keeps a bare mid-flow `compose` from falling
+  // through to Branch 10 and silently advancing the current stage. Precedes
+  // Branch 5 (scope/config-change) and Branch 7 (jump) so neither mutating
+  // path swallows a compose request.
+  if (flags.compose || flags.newScope || flags.report) {
+    if (flags.stage || flags.phase) {
+      emit(errorDirective(
+        "Cannot combine compose with --stage/--phase. Compose re-shapes the plan; jump moves the cursor. Run them separately.",
+      ));
+      return;
+    }
+    emit(composeDispatchDirective(flags, stateContent !== null));
     return;
   }
 
@@ -1218,46 +1524,6 @@ function handleNext(args: string[], projectDir: string | undefined): void {
     }
   }
 
-  // Branch 5b — test-run persistence on RESUME. When `--test-run` re-enters an
-  // EXISTING workflow whose state file lacks the `Test Run Mode` field, the
-  // marking must be re-stamped: aidlc-jump.ts:229 reads `getField(content,
-  // "Test Run Mode")` — NOT the CLI flag — for forward-jump termination, so a
-  // resume that carries the flag but not the field silently loses test-run
-  // mode (t56/t57 fail indirectly through it). Birth stamps the field via
-  // `init --test-run` (Branch 3); resume has no init to ride, so the field is
-  // absent until re-stamped. Persisting it is a MUTATION, so — exactly like
-  // scope-change/config-change (Branch 5) and the jump `execute` (Branch 7) —
-  // `next` NAMES the move (a run-then-continue print) and the conductor runs
-  // the tool; `next` stays read-only and writes nothing here. The named tool
-  // (`aidlc-utility.ts enable-test-run`) requires existing state, no-ops when
-  // the field is already present, inserts `- **Test Run Mode**: true` after the
-  // Revision Count line, and emits TEST_RUN_MODE_ENABLED. After the conductor
-  // runs it, the NEXT `next` sees the field present, this branch no-ops, and
-  // the happy path (Branch 10) emits the run-stage — the loop continues.
-  //
-  // Ordering (branch_order_check): this fires AFTER Branch 5, so a
-  // `--scope X --test-run` against a differing scope routes to scope-change
-  // first (the bigger move) and returns — test-run persistence rides the next
-  // loop iteration once the scope-change tool has re-stamped state. It is
-  // gated on `!flags.stage && !flags.phase` so a `--test-run` jump takes the
-  // jump path below (Branch 7), which threads `--test-run` into `execute`
-  // itself. And it fires BEFORE Branch 10, so the plain `next <scope>
-  // --test-run` resume persists the field before any run-stage. Composes
-  // getField — the canonical state-field read — rather than hand-rolling.
-  if (
-    stateContent &&
-    flags.testRun &&
-    !flags.stage &&
-    !flags.phase &&
-    getField(stateContent, "Test Run Mode") === null
-  ) {
-    emit(printDirective(
-      `Run \`bun ${harnessDir()}/tools/aidlc-utility.ts enable-test-run\` to persist ` +
-        "test-run mode, then re-run `next` to continue.",
-    ));
-    return;
-  }
-
   // Branch 6 — resume (SKILL.md:292). When the conductor re-enters an existing
   // workflow (`/aidlc --resume`), the prose presents a resume-choice
   // AskUserQuestion. The engine NEVER calls AskUserQuestion (it is a Bash tool
@@ -1325,25 +1591,43 @@ function handleNext(args: string[], projectDir: string | undefined): void {
     return;
   }
 
-  // Branch 8 — freeform intent with no workflow yet (SKILL.md:355-362). The
-  // user described what to build in prose rather than naming a scope. Scope
-  // inference (`detect-scope`) and recording it are MUTATIONS the conductor
-  // performs; `next` stays read-only and surfaces the scope-confirmation
-  // question as an `ask` (the engine design's `ask` = "scope confirmation"). The engine
-  // never calls AskUserQuestion itself — it emits `ask` and stops. The resolved
-  // scope here is the precedence-ladder result (flag/env/default); the
-  // conductor's keyword inference may refine it before confirming. A bare
-  // KNOWN-SCOPE positional was already handled by Branch 7b above, so the guard
-  // excludes valid-scope intents — only genuine prose reaches the freeform ask.
+  // Branch 8 - freeform intent with no workflow yet (SKILL.md:355-362). The
+  // user described what to build in prose rather than naming a scope. `next`
+  // stays read-only and surfaces the routing question as an `ask` - the engine
+  // never calls AskUserQuestion itself. A bare KNOWN-SCOPE positional was
+  // already handled by Branch 7b above, so only genuine prose reaches here.
+  //
+  // Adaptive routing (replaces the old static feature-default confirm, which
+  // interpolated the precedence-ladder scope and silently defaulted rich prose
+  // to `feature`): keyword inference (inferScopeFromText, a pure read; the
+  // audit-emitting detect-scope verb remains the conductor's recording move)
+  // now drives the ask.
+  //   - CLEAR KEYWORD HIT (source "keyword": matched a scope's keywords and
+  //     is within the matcher's word bound): a one-line confirm naming the
+  //     MATCHED scope, with "name another scope" and "compose" as outs.
+  //   - NO HIT / RICH PROSE (source "freeform": no keyword matched, or the
+  //     description is long enough that the match is likely incidental): the
+  //     COMPOSE OFFER, never a silent feature default. The conductor renders
+  //     it; on "compose" it re-runs `next compose "<text>"` to reach the
+  //     Branch 4c dispatch.
   if (
     !stateContent &&
     flags.intent &&
     !flags.scope &&
     !validScopes().has(flags.intent)
   ) {
+    const inferred = inferScopeFromText(flags.intent);
+    if (inferred.source === "keyword") {
+      emit(askDirective(
+        `Starting a "${inferred.scope}" workflow for: "${flags.intent}". ` +
+          "Confirm to proceed, name a different scope, or say \"compose\" for a tailored plan.",
+      ));
+      return;
+    }
     emit(askDirective(
-      `This looks like a "${scope}" workflow for: "${flags.intent}". ` +
-        "Confirm the scope to proceed, or name a different one.",
+      `No stock scope clearly fits: "${flags.intent}". ` +
+        "I can compose a tailored plan for this task (recommended: reply \"compose\"), " +
+        "or you can name a scope directly (e.g. bugfix, feature, poc; see /aidlc --help for all).",
     ));
     return;
   }
@@ -1418,11 +1702,16 @@ function handleNext(args: string[], projectDir: string | undefined): void {
 
   if (currentIsInFlight) {
     // Under an autonomy grant, an eligible per-unit build stage fans out as a
-    // swarm batch instead of a single run-stage. tryEmitSwarm emits the
-    // invoke-swarm directive (and returns true) only when all trigger
-    // conditions hold; otherwise the normal run-stage emit fires.
-    if (!tryEmitSwarm(currentSlug, scope, stateContent, pd)) {
-      emitRunStageForSlug(currentSlug, projectType, scope, stateContent, recordPrefix, codekbCtx);
+    // swarm batch instead of a single run-stage. tryEmitSwarm advances the swarm
+    // one batch per `next` (the first batch with an unconverged unit, then the
+    // stage's settle gate once every batch has converged) and returns true only
+    // when all trigger conditions hold; otherwise emitForSlug fires, which itself
+    // drives the engine's per-unit for_each loop for a per-unit Construction stage
+    // (one unit per `next`, gate suppressed on every uncovered unit with the real
+    // gate only on the all-covered re-entry; issue #368) and emits a single
+    // directive for every other stage.
+    if (!tryEmitSwarm(currentSlug, scope, stateContent, pd, projectType, recordPrefix, codekbCtx)) {
+      emitForSlug(currentSlug, projectType, scope, stateContent, recordPrefix, codekbCtx, pd);
     }
     return;
   }
@@ -1443,9 +1732,12 @@ function handleNext(args: string[], projectDir: string | undefined): void {
     return;
   }
   // Same swarm guard on the advance path: an eligible per-unit build stage
-  // under autonomy fans out as a batch rather than a single run-stage.
-  if (!tryEmitSwarm(next.slug, scope, stateContent, pd)) {
-    emitRunStageForSlug(next.slug, projectType, scope, stateContent, recordPrefix, codekbCtx);
+  // under autonomy fans out as a batch rather than a single run-stage. Off the
+  // swarm path, emitForSlug drives the engine's per-unit for_each loop for a
+  // per-unit Construction stage (issue #368) and emits a single directive
+  // otherwise.
+  if (!tryEmitSwarm(next.slug, scope, stateContent, pd, projectType, recordPrefix, codekbCtx)) {
+    emitForSlug(next.slug, projectType, scope, stateContent, recordPrefix, codekbCtx, pd);
   }
 }
 
@@ -1459,30 +1751,51 @@ function handleNext(args: string[], projectDir: string | undefined): void {
 const SWARM_FOR_EACH = "unit-of-work";
 const SWARM_MODE = "subagent";
 
-// Try to emit an `invoke-swarm` directive instead of a run-stage, returning true
-// (and emitting) ONLY when every trigger condition holds:
+// Try to handle an eligible autonomous swarm stage, returning true (and emitting)
+// ONLY when every trigger condition holds:
 //   - the slug resolves to a Construction stage that is the per-unit build stage
-//     (for_each:unit-of-work + mode:subagent — code-generation today);
+//     (for_each:unit-of-work + mode:subagent, code-generation today);
 //   - the human granted autonomy at the walking-skeleton ladder
 //     (Construction Autonomy Mode: autonomous);
-//   - the compiled Bolt/unit DAG yields a non-empty first batch.
-// On all-true it emits `{kind:"invoke-swarm", units: batches[0]}` — the first
-// topological level, the units eligible to fan out now — and returns true. On any
-// miss it returns false and emits nothing, so the caller falls back to the normal
-// run-stage emit (which keeps its computed gate, including the skeleton round-trip
-// sentinel). The skeleton Bolt 1 is protected two ways: temporally (autonomy stays
-// unset until the ladder fires after Bolt 1 ships) AND structurally — the
-// isSkeletonGateStage guard below refuses to swarm the walking-skeleton gate stage
-// regardless of autonomy state. The structural guard matters for scopes where the
-// per-unit build stage (code-generation) IS the skeleton-gate stage (poc / bugfix /
-// security-patch): there the skeleton's always-gated approval must never be bypassed
-// by a stray autonomous setting, so the engine enforces it rather than trusting the
-// conductor's ordering.
+//   - the compiled Bolt/unit DAG yields a non-empty batch.
+// The swarm advances ONE Bolt BATCH per `next`: it walks the batches in
+// topological order and selects the FIRST batch that still has an unconverged
+// unit, emitting `{kind:"invoke-swarm", units: <that batch's unconverged units>}`
+// so a batch with a partial pass (some units baton-returned) re-fans only the
+// units still owed. Earlier batches are never re-emitted once every one of their
+// units has converged, so the run climbs the DAG batch by batch instead of
+// re-emitting batch 1 forever. The completion signal is the audit ledger
+// (swarmConvergedUnits, the `SWARM_UNIT_CONVERGED` rows the referee writes back
+// to the main checkout), NOT artifact presence: a swarm unit's produced files
+// stay in its Bolt worktree, so the inline per-unit disk-coverage ledger never
+// sees them (that is why this path owns its own signal).
+//
+// When EVERY unit in EVERY batch has converged, the stage is built: the engine
+// emits the stage's settle directive (a run-stage for the last unit carrying the
+// stage's computed gate, the SAME shape emitPerUnitRunStage's all-covered
+// re-entry produces) so the conductor completes the stage and the workflow moves
+// on, and returns true. It does NOT return false there: the caller's fallback
+// (emitPerUnitRunStage) keys on disk coverage the swarm never lands in the main
+// tree, so it would wrongly re-run unit one inline instead of settling.
+//
+// On any trigger miss it returns false and emits nothing, so the caller falls
+// back to the normal run-stage emit (which keeps its computed gate, including the
+// skeleton round-trip sentinel). The skeleton Bolt 1 is protected two ways:
+// temporally (autonomy stays unset until the ladder fires after Bolt 1 ships) AND
+// structurally: the isSkeletonGateStage guard below refuses to swarm the
+// walking-skeleton gate stage regardless of autonomy state. The structural guard
+// matters for scopes where the per-unit build stage (code-generation) IS the
+// skeleton-gate stage (poc / bugfix / security-patch): there the skeleton's
+// always-gated approval must never be bypassed by a stray autonomous setting, so
+// the engine enforces it rather than trusting the conductor's ordering.
 function tryEmitSwarm(
   slug: string,
   scope: string,
   stateContent: string | null,
   projectDir: string,
+  projectType: "brownfield" | "greenfield" | null,
+  recordPrefix: string | null,
+  codekbCtx: CodekbCtx,
 ): boolean {
   const node = nodeForSlug(slug);
   if (!node) return false;
@@ -1494,8 +1807,41 @@ function tryEmitSwarm(
   if (readAutonomyMode(stateContent) !== "autonomous") return false;
   const batches = readBoltDagBatches(projectDir);
   if (!batches || batches.length === 0) return false;
-  const firstBatch = batches[0];
-  if (!Array.isArray(firstBatch) || firstBatch.length === 0) return false;
+
+  // Select the first topological batch with an unconverged unit; emit only that
+  // batch's still-owed units. Ledger signal = SWARM_UNIT_CONVERGED (see above),
+  // floored at this stage's latest STAGE_STARTED so a jump-driven re-run never
+  // reads a prior run's rows as coverage.
+  const converged = swarmConvergedUnits(projectDir, slug);
+  let pendingUnits: string[] | null = null;
+  for (const batch of batches) {
+    if (!Array.isArray(batch) || batch.length === 0) continue;
+    const owed = batch.filter((u) => !converged.has(u));
+    if (owed.length > 0) {
+      pendingUnits = owed;
+      break;
+    }
+  }
+
+  // Every unit in every batch has converged (and the DAG had at least one unit):
+  // the stage is fully built. Emit its settle directive, a run-stage for the
+  // last unit carrying the stage's computed gate, so the conductor runs the
+  // learnings ritual + single stage gate and `report --approved` advances the
+  // workflow (the report-side per-unit coverage guard already exempts the
+  // autonomous swarm, so the approve is not refused for the worktree-only
+  // artifacts).
+  if (pendingUnits === null) {
+    const flatUnits = batches.flat();
+    if (flatUnits.length === 0) return false;
+    const lastUnit = flatUnits[flatUnits.length - 1];
+    const directive = buildRunStageDirective(
+      node, projectType, lastUnit, scope, stateContent, recordPrefix, codekbCtx,
+    );
+    directive.unit = lastUnit;
+    emit(directive);
+    return true;
+  }
+
   // Thread the construction repo to the conductor when the engine can resolve it
   // DETERMINISTICALLY (read-only — intentRepos never throws; it returns [] for a
   // legacy/flat intent). NOT resolveConstructionRepo here: that THROWS on >1, and
@@ -1510,9 +1856,9 @@ function tryEmitSwarm(
   //     intent, surfacing the choice rather than guessing.
   const repos = intentRepos(projectDir);
   if (repos.length === 1) {
-    emit({ kind: "invoke-swarm", units: firstBatch, repo: repos[0] });
+    emit({ kind: "invoke-swarm", units: pendingUnits, repo: repos[0] });
   } else {
-    emit({ kind: "invoke-swarm", units: firstBatch });
+    emit({ kind: "invoke-swarm", units: pendingUnits });
   }
   return true;
 }
@@ -1540,6 +1886,178 @@ function emitRunStageForSlug(
     return;
   }
   emit(buildRunStageDirective(node, projectType, UNIT_NAME_PLACEHOLDER, scope, stateContent, recordPrefix, codekbCtx));
+}
+
+// --- Per-unit iteration (issue #368): the engine drives the for_each loop ---
+//
+// A per-unit Construction stage (for_each: unit-of-work) runs ONCE PER Unit of
+// Work, but the state file carries ONE checkbox row per stage slug (the engine
+// never duplicates rows, verified). So a single checkbox cannot, on its own,
+// track "stage done for 3 of 9 units". The COVERAGE LEDGER is the per-unit
+// ARTIFACTS on disk: a unit is "covered" for this stage once all of the stage's
+// produces[] exist under <recordPrefix>/construction/<unit>/<slug>/. The engine
+// walks the ordered unit list (the compiled Bolt DAG, flattened to topo order),
+// finds the FIRST uncovered unit, and emits a run-stage for THAT concrete unit,
+// with the gate SUPPRESSED (false) on EVERY not-yet-covered unit. The conductor
+// completes the unit's body, writes its artifacts, and re-runs `next` WITHOUT
+// reporting; the single checkbox stays in-flight and the engine hands back the
+// next uncovered unit. Once the LAST unit's artifacts land on disk, the next
+// `next` re-enters with no uncovered units and presents the stage's real gate
+// (see emitPerUnitRunStage's pick === null branch), so the human approves once
+// (covering all units, only after every unit is built) and the checkbox flips.
+// No unit DAG (a scope that SKIPs units-generation, or pre-compile) degrades to
+// today's single {unit-name} directive, zero behaviour change.
+
+// The ordered Unit-of-Work list for the active intent: the compiled Bolt DAG's
+// batches flattened to topological order (each batch is already lexicographically
+// sorted by computeBatches). [] when there is no compiled DAG (degrade path).
+function orderedUnits(projectDir: string): string[] {
+  const batches = readBoltDagBatches(projectDir);
+  if (!batches) return [];
+  return batches.flat();
+}
+
+// True when `unit` is COVERED for `node`, every artifact in node.produces[]
+// exists on disk under the resolved per-unit path
+// (<recordPrefix>/construction/<unit>/<owner.slug>/<name>.md). The resolved path
+// is workspace-RELATIVE with forward slashes, so we re-root it absolutely under
+// projectDir (splitting on "/" so the join is OS-correct). A stage with no
+// produces can never be "covered" by artifacts, but all five per-unit stages
+// declare >=2 produces (verified), so the empty case is unreachable in practice;
+// we treat empty-produces as NOT covered so the engine never silently skips a
+// unit it cannot prove it ran.
+function unitCovered(
+  projectDir: string,
+  node: GraphStage,
+  unit: string,
+  recordPrefix: string | null,
+  codekbCtx: CodekbCtx,
+): boolean {
+  const names = node.produces ?? [];
+  if (names.length === 0) return false;
+  for (const name of names) {
+    const rel = resolveArtifactPath(name, node, unit, recordPrefix, codekbCtx);
+    const abs = join(projectDir, ...rel.split("/"));
+    if (!existsSync(abs)) return false;
+  }
+  return true;
+}
+
+// Walk the ordered unit list and find the units whose artifacts are not all
+// present on disk. Returns {unit, uncovered} where `unit` is the FIRST uncovered
+// unit (the one the engine emits next) and `uncovered` is the full ordered list
+// of not-yet-covered units (so the caller can name them without re-scanning the
+// disk), or null when EVERY unit is already covered (the stage's per-unit work is
+// complete; the caller then presents the final gate, see emitPerUnitRunStage).
+// Order is the topo order from orderedUnits, so the engine produces unit
+// dependencies before their dependents.
+function nextUncoveredUnit(
+  projectDir: string,
+  node: GraphStage,
+  units: string[],
+  recordPrefix: string | null,
+  codekbCtx: CodekbCtx,
+): { unit: string; uncovered: string[] } | null {
+  const uncovered = units.filter(
+    (u) => !unitCovered(projectDir, node, u, recordPrefix, codekbCtx),
+  );
+  if (uncovered.length === 0) return null;
+  return { unit: uncovered[0], uncovered };
+}
+
+// Emit ONE iteration of a per-unit Construction stage. The engine owns the
+// for_each loop here: it resolves the next uncovered unit, substitutes the real
+// unit name for {unit-name} in every path, and suppresses the gate for EVERY
+// not-yet-covered unit. The stage's real gate is presented exactly once, on the
+// all-covered re-entry (pick === null), after the last unit's artifacts exist on
+// disk. See the ledger note above emitRunStageForSlug's per-unit section.
+function emitPerUnitRunStage(
+  node: GraphStage,
+  projectType: "brownfield" | "greenfield" | null,
+  scope: string,
+  stateContent: string | null,
+  recordPrefix: string | null,
+  codekbCtx: CodekbCtx,
+  projectDir: string,
+): void {
+  // GATE precedence: never iterate per-unit until the walking-skeleton gate is
+  // RESOLVED. If this is the skeleton-gate stage and no stance is recorded yet,
+  // buildRunStageDirective would emit gate:"unresolved" (the classify
+  // round-trip). The conductor must classify the stance FIRST, there is no
+  // per-unit work to do while the gate is undetermined, so emit the normal
+  // single directive (with the {unit-name} placeholder + the unresolved gate)
+  // and return. The follow-up `next` (after `report --skeleton-stance`) resolves
+  // the gate and re-enters here to begin per-unit iteration.
+  if (isSkeletonGateStage(node, scope) && readSkeletonStance(stateContent) === null) {
+    emitRunStageForSlug(node.slug, projectType, scope, stateContent, recordPrefix, codekbCtx);
+    return;
+  }
+
+  // No compiled unit DAG (a scope that SKIPs units-generation, refactor /
+  // security-patch / infra / bugfix / poc, or a pre-compile moment): degrade to
+  // today's single {unit-name} directive. Zero behaviour change off this path.
+  const units = orderedUnits(projectDir);
+  if (units.length === 0) {
+    emitRunStageForSlug(node.slug, projectType, scope, stateContent, recordPrefix, codekbCtx);
+    return;
+  }
+
+  const pick = nextUncoveredUnit(projectDir, node, units, recordPrefix, codekbCtx);
+  if (pick === null) {
+    // Every unit is already covered, but the checkbox is still in-flight: the
+    // conductor wrote the LAST unit's artifacts and re-ran `next` to settle the
+    // stage. There is nothing left to PRODUCE, so present the stage gate now (its
+    // REAL computed gate) on the last unit, so the human approves once and the
+    // engine advances. This is the ONLY directive on which the gate fires, so the
+    // approval is reached only after every unit's artifacts exist (closing the
+    // last-unit hole: no unit, not even the final one, can be skipped). It is also
+    // the re-entry after a "request changes" that re-ran a unit and then
+    // everything is covered again.
+    const lastUnit = units[units.length - 1];
+    const directive = buildRunStageDirective(
+      node, projectType, lastUnit, scope, stateContent, recordPrefix, codekbCtx,
+    );
+    directive.unit = lastUnit;
+    emit(directive);
+    return;
+  }
+
+  const directive = buildRunStageDirective(
+    node, projectType, pick.unit, scope, stateContent, recordPrefix, codekbCtx,
+  );
+  // Suppress the gate on EVERY not-yet-covered unit. A per-unit directive with an
+  // uncovered unit carries gate:false: the conductor completes the body, writes
+  // the unit's artifacts, and re-runs `next` (NO report-approve), so the checkbox
+  // stays in-flight and the engine emits the next uncovered unit. Once the LAST
+  // unit's artifacts land on disk, the next `next` takes the pick === null branch
+  // above and presents the stage's real gate, so the single human approval covers
+  // the whole stage only after all units are built. We override AFTER building so
+  // the rest of the directive (paths, reviewer, persona) is unchanged.
+  directive.gate = false;
+  directive.unit = pick.unit;
+  emit(directive);
+}
+
+// Route a slug to its emit path: a per-unit Construction stage drives the
+// engine's for_each loop (emitPerUnitRunStage); every other stage emits the
+// single {unit-name}-or-non-per-unit directive (emitRunStageForSlug). Called
+// from BOTH handleNext sites AFTER tryEmitSwarm has returned false, so
+// autonomous code-gen still swarms and only the non-swarm path reaches here.
+function emitForSlug(
+  slug: string,
+  projectType: "brownfield" | "greenfield" | null,
+  scope: string,
+  stateContent: string | null,
+  recordPrefix: string | null,
+  codekbCtx: CodekbCtx,
+  projectDir: string,
+): void {
+  const node = nodeForSlug(slug);
+  if (node && isPerUnit(node)) {
+    emitPerUnitRunStage(node, projectType, scope, stateContent, recordPrefix, codekbCtx, projectDir);
+    return;
+  }
+  emitRunStageForSlug(slug, projectType, scope, stateContent, recordPrefix, codekbCtx);
 }
 
 // --- --single stage-runner mode ---
@@ -1694,17 +2212,11 @@ function emitJumpDirective(
     // Committing the jump is a MUTATION — name the move (print) and let the
     // conductor run `execute`, exactly as scope-change/config-change do. The
     // command carries the tool-resolved direction so `execute` skips/resets the
-    // right stages, emits STAGE_JUMPED, and pivots Current Stage. --test-run
-    // rides through: resolve/execute honour it, and `execute --test-run` owns
-    // the terminal stop for a test-run forward jump (SKILL.md origin/main:92).
-    // After the conductor runs it, the NEXT `next` sees the pivoted state and
-    // emits the run-stage for the now-current target.
-    const executeParts = [
-      `execute --target ${targetSlug} --direction ${direction} --scope ${scope}`,
-    ];
-    if (flags.testRun) executeParts.push("--test-run");
+    // right stages, emits STAGE_JUMPED, and pivots Current Stage. After the
+    // conductor runs it, the NEXT `next` sees the pivoted state and emits the
+    // run-stage for the now-current target.
     emit(printDirective(
-      `Run \`bun ${harnessDir()}/tools/aidlc-jump.ts ${executeParts.join(" ")}\` to perform the jump, then re-run \`next\` to continue from the jump target.`,
+      `Run \`bun ${harnessDir()}/tools/aidlc-jump.ts execute --target ${targetSlug} --direction ${direction} --scope ${scope}\` to perform the jump, then re-run \`next\` to continue from the jump target.`,
     ));
     return;
   }
@@ -1734,11 +2246,7 @@ function emitJumpDirective(
     // codekb ctx is computed from the same live projectDir (no handleNext-cached
     // value reaches this inline site), so a codekb stage jumped-to here still
     // resolves under aidlc/spaces/<space>/codekb/<repo>/.
-    emitRunStageForSlug(first.slug, projectType, scope, null, relativeRecordDir(projectDir), {
-      projectDir,
-      space: activeSpace(projectDir),
-      codekbRepo: codekbRepoName(projectDir),
-    });
+    emitRunStageForSlug(first.slug, projectType, scope, null, relativeRecordDir(projectDir), codekbCtxFor(projectDir));
     return;
   }
 
@@ -1775,11 +2283,7 @@ function emitJumpDirective(
   // No-state jump: scope feeds the gate; stateContent is null (no workflow yet).
   // codekb ctx computed off the same live projectDir as the inline recordPrefix
   // (same rationale as the --phase inline site above).
-  emit(buildRunStageDirective(node, projectType, UNIT_NAME_PLACEHOLDER, scope, null, relativeRecordDir(projectDir), {
-    projectDir,
-    space: activeSpace(projectDir),
-    codekbRepo: codekbRepoName(projectDir),
-  }));
+  emit(buildRunStageDirective(node, projectType, UNIT_NAME_PLACEHOLDER, scope, null, relativeRecordDir(projectDir), codekbCtxFor(projectDir)));
 }
 
 // Pull `target_slug` AND `direction` out of `aidlc-jump.ts resolve`'s stdout
@@ -1878,15 +2382,13 @@ interface ReportFlags {
   result?: string;
   userInput?: string;
   reason?: string;
-  testRun?: boolean;
   skeletonStance?: string; // the classify round-trip's classified stance
   single?: boolean; // --single: commit a synthetic-id STAGE_STARTED/COMPLETED pair, never the main pointer
   stage?: string; // --stage <slug>: the acted stage (required under --single; preferred for main workflow reports)
 }
 
 // Extract report's flags. --result is the verdict; --user-input rides through
-// to approve's GATE_APPROVED row; --reason rides through to complete-workflow;
-// --test-run rides through to approve (it auto-approves and stamps Test-Run).
+// to approve's GATE_APPROVED row; --reason rides through to complete-workflow.
 // --skeleton-stance carries the conductor's classified walking-skeleton stance
 // (the classify round-trip): it does NOT commit a transition — it records the
 // stance so the next `next` resolves the deferred gate.
@@ -1909,8 +2411,6 @@ function parseReportFlags(args: string[]): ReportFlags {
     } else if (a === "--stage" && i + 1 < args.length) {
       flags.stage = args[i + 1];
       i++;
-    } else if (a === "--test-run") {
-      flags.testRun = true;
     } else if (a === "--single") {
       flags.single = true;
     }
@@ -2167,7 +2667,6 @@ function checkboxForSlug(
 function approveArgs(slug: string, flags: ReportFlags): string[] {
   const args = ["approve", slug];
   if (flags.userInput) args.push("--user-input", flags.userInput);
-  if (flags.testRun) args.push("--test-run");
   return args;
 }
 
@@ -2283,6 +2782,58 @@ function handleReport(args: string[], projectDir: string | undefined): void {
     return;
   }
   const isGated = node.phase !== "initialization";
+
+  // Per-unit coverage gate (issue #368), DETERMINISTIC enforcement on the
+  // approve path. The engine only PRESENTS the stage's real gate once every unit
+  // is covered (emitPerUnitRunStage suppresses gate:false on every uncovered unit
+  // and fires the real gate only on the all-covered re-entry), but a hand-flipped
+  // checkbox or a conductor that reported the wrong directive could still try to
+  // approve early and complete the stage for only some of N units. So before
+  // committing a gated per-unit stage's transition, require that EVERY unit is
+  // covered. If any unit is still uncovered, refuse with an error naming the
+  // remaining units, the conductor must run `next` to finish them first. Only
+  // enforced when a unit DAG exists (units.length>0); no DAG = single-iteration =
+  // no guard (matches the degrade path in emitPerUnitRunStage).
+  //
+  // Scoped to a NOT-yet-completed stage: an already-[x] stage is an idempotent
+  // re-report (a recovery replay) that the completed-stage branch below absorbs,
+  // and its artifacts may legitimately be absent (a fresh clone, moved files), so
+  // the guard must not turn a harmless replay into an error.
+  //
+  // Scoped to the INLINE per-unit loop, NOT the autonomous code-generation swarm.
+  // The swarm climbs the Bolt DAG one BATCH per `next` (tryEmitSwarm emits the
+  // first batch with an unconverged unit, then presents the stage's single gate
+  // once every batch has converged), with the swarm referee (aidlc-swarm.ts
+  // finalize) verifying each batch's convergence before its merge. The referee's
+  // `complete --merge` consolidates only the AIDLC metadata back to the main
+  // checkout (a converged unit's produced artifacts stay in its Bolt worktree),
+  // so this disk-coverage check would find EVERY swarm unit uncovered and refuse
+  // the approve outright even after the whole stage has built. So we exclude the
+  // swarm condition (per-unit + mode:subagent + autonomous) from the guard and
+  // let the swarm's own per-batch convergence (SWARM_UNIT_CONVERGED, the ledger
+  // signal tryEmitSwarm advances on) stand as its coverage proof. The guard
+  // remains for every inline per-unit stage (the four design stages, and
+  // code-generation when it falls back to the inline path off the swarm).
+  const isAutonomousSwarm =
+    node.mode === SWARM_MODE && readAutonomyMode(stateContent) === "autonomous";
+  if (isGated && isPerUnit(node) && stageCheckbox.state !== "completed" && !isAutonomousSwarm) {
+    const recordPrefix = relativeRecordDir(pd);
+    const codekbCtx = codekbCtxFor(pd);
+    const units = orderedUnits(pd);
+    if (units.length > 0) {
+      const pick = nextUncoveredUnit(pd, node, units, recordPrefix, codekbCtx);
+      if (pick !== null) {
+        emit({
+          kind: "error",
+          message:
+            `Stage "${slug}" is per-unit (for_each: unit-of-work) and ${pick.uncovered.length} of ` +
+            `${units.length} units are not yet complete (${pick.uncovered.join(", ")}). ` +
+            "Run `next` to continue the remaining units before approving.",
+        });
+        return;
+      }
+    }
+  }
 
   // Finality — is there an in-scope stage after this one? (state-override aware,
   // so EXECUTE/SKIP suffixes and prior [x]/[S] checkboxes are honoured.)
@@ -2408,6 +2959,32 @@ function handleReport(args: string[], projectDir: string | undefined): void {
   });
 }
 
+// The `park` handler (issue #367). Parks the workflow at the current inter-stage
+// boundary: it shells out to `aidlc-state.ts park` (which persists the
+// Parked/Parked At Stage runtime markers, emits WORKFLOW_PARKED, and refuses
+// under autonomous Construction), then emits the terminal `parked` directive the
+// Stop hook honours as a clean turn-end. Mutation lives entirely in the spawned
+// subcommand - the engine itself writes nothing, mirroring report's discipline.
+// A non-zero exit (e.g. the autonomy refusal, or an already-completed workflow)
+// is relayed verbatim as an error directive.
+function handlePark(_args: string[], projectDir: string | undefined): void {
+  const pd = resolveProjectDir(projectDir);
+  const res = spawnState(pd, ["park"]);
+  if (res.exitCode !== 0) {
+    const detail = (res.stderr || res.stdout).trim();
+    emit(errorDirective(`Cannot park the workflow${detail ? `: ${detail}` : "."}`));
+    return;
+  }
+  const stateContent = loadStateFileIfPresent(pd);
+  const parkedAt = stateContent
+    ? (getField(stateContent, "Parked At Stage") ?? "").trim()
+    : "";
+  emit(parkedDirective(
+    `Workflow parked at "${parkedAt}". Resume with /aidlc --resume.`,
+    parkedAt,
+  ));
+}
+
 // --- CLI entry point ---
 
 function main(): void {
@@ -2435,11 +3012,14 @@ function main(): void {
     case "report":
       handleReport(subArgs, projectDir);
       break;
+    case "park":
+      handlePark(subArgs, projectDir);
+      break;
     default:
       // Unknown / missing subcommand — usage to stderr, exit 1. Matches the
       // stderr-only usage shape the sibling tools use for a bad subcommand.
       console.error(
-        `Unknown subcommand: ${subcommand ?? "(none)"}. Valid: next, report`,
+        `Unknown subcommand: ${subcommand ?? "(none)"}. Valid: next, report, park`,
       );
       process.exit(1);
   }

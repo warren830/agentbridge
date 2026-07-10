@@ -20,6 +20,17 @@
     "command": "bun $CLAUDE_PROJECT_DIR/.claude/hooks/aidlc-statusline.ts"
   },
   "hooks": {
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bun $CLAUDE_PROJECT_DIR/.claude/hooks/aidlc-mint-presence.ts"
+          }
+        ]
+      }
+    ],
     "SessionStart": [
       {
         "matcher": "",
@@ -62,6 +73,15 @@
           {
             "type": "command",
             "command": "bun $CLAUDE_PROJECT_DIR/.claude/hooks/aidlc-sync-statusline.ts"
+          }
+        ]
+      },
+      {
+        "matcher": "AskUserQuestion",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bun $CLAUDE_PROJECT_DIR/.claude/hooks/aidlc-mint-presence.ts"
           }
         ]
       },

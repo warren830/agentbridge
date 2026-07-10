@@ -1,7 +1,7 @@
 // Directive schema — the frozen engine↔conductor interface. The engine
 // (aidlc-orchestrate.ts) answers "what's next?" with exactly one typed
 // `Directive`; the conductor reads its `kind` and does the one move it names.
-// This module defines the discriminated union over the 8 kinds the engine can
+// This module defines the discriminated union over the 9 kinds the engine can
 // emit, plus a runtime validator. Sibling of aidlc-stage-schema.ts and
 // aidlc-sensor-schema.ts — same tool-boundary discipline: a refused or
 // malformed directive is a clear signal, not a silent miss.
@@ -37,7 +37,7 @@ import { isPlainObject } from "./aidlc-lib.ts";
 export const GATE_UNRESOLVED = "unresolved" as const;
 export type GateValue = boolean | typeof GATE_UNRESOLVED;
 
-// The 8 kinds, keyed on the `kind` discriminator.
+// The 9 kinds, keyed on the `kind` discriminator.
 export type DirectiveKind =
   | "run-stage"
   | "dispatch-subagent"
@@ -46,7 +46,8 @@ export type DirectiveKind =
   | "ask"
   | "print"
   | "error"
-  | "done";
+  | "done"
+  | "parked";
 
 // run-stage — load lead + support agents, load `consumes` artifacts, run the
 // stage body, write `produces`, keep memory.md. Routing fields (lead_agent,
@@ -67,6 +68,9 @@ export interface RunStageDirective {
   // classify round-trip — see GATE_UNRESOLVED above).
   gate: GateValue;
   memory_path: string;
+  // consumes carries only the declared inputs that EXIST on disk at emit time;
+  // declared inputs whose file is absent move to consumes_absent so the
+  // conductor is never pointed at a path that cannot be read.
   consumes: string[];
   produces: string[];
   rules_in_context: string[];
@@ -85,6 +89,40 @@ export interface RunStageDirective {
   // in-context, with no skill referencing that file by path. Absent on every
   // later directive (the persona persists in the session once delivered).
   conductor_persona?: string;
+  // next_stage: the display name of the in-scope stage that FOLLOWS this one,
+  // resolved by the engine so the approval gate's Approve option can read
+  // "Continue to <next_stage>" verbatim. null = this is the final in-scope
+  // stage (the conductor renders "Complete workflow" instead). Optional: absent
+  // and null both carry no next-stage name. The conductor renders this value
+  // verbatim and NEVER infers the next stage itself (issue: the placeholder used
+  // to render as a guessed "Code Generation" regardless of the real target).
+  next_stage?: string | null;
+  // unit: present ONLY on a per-unit Construction directive (for_each:
+  // unit-of-work) that the engine resolved to a CONCRETE Unit of Work; absent
+  // otherwise, and absent when the engine fell back to the {unit-name}
+  // placeholder (no compiled unit DAG). It is informational for the conductor
+  // (the produces/consumes/memory paths already carry the unit segment) AND a
+  // marker that this run-stage is ONE iteration of N: the engine drives the
+  // per-unit loop, re-emitting the next uncovered unit on each `next` and
+  // suppressing the gate (gate:false) on EVERY not-yet-covered unit. The stage's
+  // real gate is presented only once, on the re-entry after the last unit's
+  // artifacts land on disk (no uncovered units remain), so the conductor must
+  // build a gate:false unit and re-run `next` rather than approve it. See
+  // aidlc-orchestrate.ts emitPerUnitRunStage.
+  unit?: string;
+  // consumes_absent: REQUIRED declared inputs whose resolved file does NOT
+  // exist on disk at emit time, each annotated with why. `expected: true` =
+  // the producing stage is not on the active scope's path (the scope
+  // deliberately skipped it — absence is by design; substitute available
+  // context, do not invent the artifact). `expected: false` = a producer IS
+  // on the path but the file is still missing (runtime-skipped conditional
+  // producer, or a real gap worth surfacing per stage-protocol-recovery).
+  // Optional (`required: false`) consumes never appear here — missing means
+  // dropped, not flagged. Omitted entirely when nothing qualifies, and on
+  // the ctx-less emit path (no projectDir to check against). Paths with an
+  // unresolved {unit-name} placeholder are never listed here (existence is
+  // unknowable).
+  consumes_absent?: Array<{ path: string; expected: boolean }>;
 }
 
 // dispatch-subagent — same as run-stage, but the stage runs via a Task call to
@@ -106,6 +144,8 @@ export interface DispatchSubagentDirective {
   stage_file: string;
   worker: string;
   conductor_persona?: string;
+  next_stage?: string | null;
+  consumes_absent?: Array<{ path: string; expected: boolean }>;
 }
 
 // invoke-swarm — fan out N parallel workers across N worktrees for a build
@@ -169,6 +209,18 @@ export interface DoneDirective {
   reason: string;
 }
 
+// parked - the workflow was intentionally parked mid-flow (a human resumes it
+// later via /aidlc --resume). Distinct from `done` (which means "workflow
+// complete"): a parked workflow has in-scope stages still pending. The Stop
+// hook treats `parked` as a terminal allow, so the conductor can end its turn
+// at a clean inter-stage boundary instead of rubber-stamping stages to reach
+// `done` (issue #367). `stage` names the slug the workflow parked at.
+export interface ParkedDirective {
+  kind: "parked";
+  reason: string;
+  stage: string;
+}
+
 // The Directive union — the engine emits exactly one of these per `next`.
 export type Directive =
   | RunStageDirective
@@ -178,7 +230,8 @@ export type Directive =
   | AskDirective
   | PrintDirective
   | ErrorDirective
-  | DoneDirective;
+  | DoneDirective
+  | ParkedDirective;
 
 export type ValidationResult =
   | { valid: true; data: Directive }
@@ -186,7 +239,7 @@ export type ValidationResult =
 
 // --- Exported constants (imported by tests) ---
 
-// The 8 kinds, in the engine design's catalogue order. Used both for the unknown-kind
+// The 9 kinds, in the engine design's catalogue order. Used both for the unknown-kind
 // error message and as the discriminator allowlist.
 export const VALID_KINDS = [
   "run-stage",
@@ -197,6 +250,7 @@ export const VALID_KINDS = [
   "print",
   "error",
   "done",
+  "parked",
 ] as const;
 
 // The mode enum carried by run-stage / dispatch-subagent. Mirrors
@@ -225,6 +279,9 @@ const RUN_STAGE_FIELDS = [
   "reviewer",
   "reviewer_max_iterations",
   "conductor_persona",
+  "next_stage",
+  "unit",
+  "consumes_absent",
 ] as const;
 
 // dispatch-subagent = run-stage fields + `worker`.
@@ -236,6 +293,7 @@ const ASK_FIELDS = ["kind", "question"] as const;
 const PRINT_FIELDS = ["kind", "message"] as const;
 const ERROR_FIELDS = ["kind", "message"] as const;
 const DONE_FIELDS = ["kind", "reason"] as const;
+const PARKED_FIELDS = ["kind", "reason", "stage"] as const;
 
 const KNOWN_FIELDS_BY_KIND: Readonly<Record<DirectiveKind, readonly string[]>> = {
   "run-stage": RUN_STAGE_FIELDS,
@@ -246,6 +304,7 @@ const KNOWN_FIELDS_BY_KIND: Readonly<Record<DirectiveKind, readonly string[]>> =
   print: PRINT_FIELDS,
   error: ERROR_FIELDS,
   done: DONE_FIELDS,
+  parked: PARKED_FIELDS,
 };
 
 // --- Validator ---
@@ -320,6 +379,10 @@ export function validateDirective(obj: unknown): ValidationResult {
     case "done":
       checkString(o, "reason", kind, errors);
       break;
+    case "parked":
+      checkString(o, "reason", kind, errors);
+      checkString(o, "stage", kind, errors);
+      break;
     // No default: the union is exhaustive — every member of DirectiveKind has a
     // case above. TS flags a missing case at compile time if a kind is added.
   }
@@ -360,11 +423,23 @@ function checkRunStageShared(
   checkStringArray(o, "sensors_applicable", kind, errors);
   checkString(o, "stage_file", kind, errors);
   checkOptionalString(o, "conductor_persona", kind, errors);
+  // next_stage: optional-nullable on a run-stage directive. Present as a string
+  // names the following in-scope stage; null means this is the final in-scope
+  // stage; absent carries no name. So string OR null validates; any other
+  // present value is rejected.
+  checkOptionalNullableString(o, "next_stage", kind, errors);
   // reviewer fields — optional on a run-stage directive (present only when the
   // stage declares a reviewer). Mirror the stage-schema validator: reviewer is
   // an optional string, reviewer_max_iterations an optional positive integer.
   checkOptionalString(o, "reviewer", kind, errors);
   checkOptionalPositiveInteger(o, "reviewer_max_iterations", kind, errors);
+  // unit: optional on a run-stage directive (present only on a per-unit
+  // Construction directive resolved to a concrete Unit of Work). A present
+  // value must be a string; absent is valid.
+  checkOptionalString(o, "unit", kind, errors);
+  // consumes_absent: optional (present only when a declared consume's file is
+  // missing at emit time). Each entry must be {path: string, expected: boolean}.
+  checkOptionalConsumesAbsent(o, "consumes_absent", kind, errors);
 }
 
 // --- Helpers (mirror aidlc-stage-schema.ts: presence first, then type) ---
@@ -426,6 +501,22 @@ function checkOptionalString(
   }
 }
 
+// checkOptionalNullableString - a field that may be absent, but if present must
+// be a string OR null (e.g. next_stage, where null is the meaningful "final
+// in-scope stage" signal, distinct from absent).
+function checkOptionalNullableString(
+  o: Record<string, unknown>,
+  field: string,
+  kind: DirectiveKind,
+  errors: string[],
+): void {
+  if (!(field in o)) return;
+  const v = o[field];
+  if (v !== null && typeof v !== "string") {
+    errors.push(`${kind}: ${field} must be string or null, got ${describe(v)}`);
+  }
+}
+
 // checkOptionalPositiveInteger — a field that may be absent, but if present
 // must be a positive integer (>= 1) — e.g. reviewer_max_iterations. Mirrors
 // the stage-schema validator's checkPositiveInteger so the directive contract
@@ -443,6 +534,43 @@ function checkOptionalPositiveInteger(
       `${kind}: ${field} must be a positive integer, got ${describe(v)}`,
     );
   }
+}
+
+// checkOptionalConsumesAbsent — a field that may be absent, but if present
+// must be an array of {path: string, expected: boolean} objects. Mirrors the
+// checkOptional* early-return idiom and checkStringArray's per-element error
+// wording.
+function checkOptionalConsumesAbsent(
+  o: Record<string, unknown>,
+  field: string,
+  kind: DirectiveKind,
+  errors: string[],
+): void {
+  if (!(field in o)) return;
+  const v: unknown = o[field];
+  if (!Array.isArray(v)) {
+    errors.push(`${kind}: ${field} must be array, got ${describe(v)}`);
+    return;
+  }
+  const arr: unknown[] = v;
+  arr.forEach((item: unknown, i: number) => {
+    if (!isPlainObject(item)) {
+      errors.push(
+        `${kind}: ${field}[${i}] must be object, got ${describe(item)}`,
+      );
+      return;
+    }
+    if (typeof item.path !== "string") {
+      errors.push(
+        `${kind}: ${field}[${i}].path must be string, got ${describe(item.path)}`,
+      );
+    }
+    if (typeof item.expected !== "boolean") {
+      errors.push(
+        `${kind}: ${field}[${i}].expected must be boolean, got ${describe(item.expected)}`,
+      );
+    }
+  });
 }
 
 function checkStringArray(
@@ -485,10 +613,10 @@ function checkEnum(
 
 // --- CLI self-check ---
 //
-// `bun aidlc-directive.ts` constructs one well-formed example of each of the 8
+// `bun aidlc-directive.ts` constructs one well-formed example of each of the 9
 // kinds, validates each, prints one line per kind ("<kind>: VALID" or the
-// errors), and exits 0 iff all 8 validate. Satisfies the acceptance check
-// "bun .../aidlc-directive.ts validates the 8 kinds".
+// errors), and exits 0 iff all 9 validate. Satisfies the acceptance check
+// "bun .../aidlc-directive.ts validates the 9 kinds".
 if (import.meta.main) {
   // One well-formed example per kind. run-stage mirrors the engine design's example
   // directive verbatim (application-design); the others follow the same catalogue table.
@@ -512,6 +640,7 @@ if (import.meta.main) {
       ],
       sensors_applicable: ["required-sections", "upstream-coverage"],
       stage_file: ".claude/aidlc-common/stages/inception/application-design.md",
+      next_stage: "Units Generation",
     },
     {
       kind: "dispatch-subagent",
@@ -549,6 +678,7 @@ if (import.meta.main) {
     { kind: "print", message: "AIDLC framework version 0.0.0" },
     { kind: "error", message: 'Unknown scope: "frobnicate"' },
     { kind: "done", reason: "Workflow complete — all in-scope stages approved." },
+    { kind: "parked", reason: 'Workflow parked at "feasibility". Resume with /aidlc --resume.', stage: "feasibility" },
     // The classify-round-trip skeleton case: gate is the unresolved sentinel,
     // and the first run-stage of a workflow also carries the conductor persona.
     {

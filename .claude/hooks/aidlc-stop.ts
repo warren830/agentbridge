@@ -34,13 +34,18 @@
 //   2. A NO-PROGRESS counter — consecutive blocks with no intervening workflow
 //      advance (no `report` ran, so the position signature is unchanged). It is
 //      persisted across the rapid-fire blocks in a transient file under
-//      aidlc-docs/.aidlc-stop-hook/. Under an 8-block ceiling exposed as
-//      CLAUDE_CODE_STOP_HOOK_BLOCK_CAP (default 8), once the count reaches the
-//      cap we LET GO (allow the stop). When the workflow advances, the signature
-//      changes and the counter resets to 0, so a healthy loop is never throttled.
+//      aidlc-docs/.aidlc-stop-hook/. Under a no-progress ceiling exposed as
+//      CLAUDE_CODE_STOP_HOOK_BLOCK_CAP, once the count reaches the cap we LET GO
+//      (allow the stop). The default ceiling is run-mode aware: an unattended
+//      autonomous Construction run keeps the long ceiling (8, the loop must run
+//      to completion with no human to release it), while an INTERACTIVE run uses
+//      a low ceiling (2, issue #365 itself recommends BLOCK_CAP=2 as the
+//      workaround) so a human who just wants to pause/chat is released after one
+//      nudge, not eight. When the workflow advances, the signature changes and
+//      the counter resets to 0, so a healthy loop is never throttled.
 //
-// Three human-wait carve-outs keep the hook from punishing a turn that ended
-// *because* it is waiting on the human:
+// Four human-wait carve-outs keep the hook from punishing a turn that ended
+// *because* it is waiting on the human (or is simply conversational):
 //   1. The Esc interrupt is FREE: Stop hooks do not fire on user interrupt, so
 //      an Esc can never be trapped — no code needed for that case.
 //   2. The interactive GATE is not free: the Stop hook DOES fire when the
@@ -61,6 +66,19 @@
 //      autonomous Construction (the loop must keep running there), and any miss
 //      — no file, all answered, autonomous, or a read error — falls through to
 //      the cap-bounded block, so a genuine mid-stage quit is still nudged.
+//   4. A CONVERSATIONAL turn ends with the human's last prompt answered and NO
+//      workflow-engine engagement (the conductor ran neither aidlc-orchestrate
+//      nor aidlc-state since that prompt). Issue #365's broader reading: a human
+//      who just wants to CHAT mid-workflow should not be nudged at all. We read
+//      the harness transcript (Claude / Codex deliver `transcript_path` on the
+//      Stop payload; Kiro delivers none, so this carve-out is inert there and
+//      the run-mode-aware cap above is its safety net) and ALLOW the stop when
+//      the most recent genuine human prompt was answered with zero engine calls
+//      (isConversationalStop below). POSITIVE-CONFIRMATION only and fail-closed:
+//      it never fires under autonomous Construction, and any engine call in the
+//      responding turn, an unreadable transcript, no human prompt found, or any
+//      parse miss falls through to the cap-bounded block. It only ever ALLOWS;
+//      it can never block more.
 //
 // No-op outside AIDLC. The frontmatter Stop matcher scopes this to the `aidlc`
 // skill, but we defend here too: with no active workflow (no aidlc-state.md
@@ -89,16 +107,34 @@ const HOOK_NAME = "stop";
 
 // The block-cap ceiling: the maximum number of consecutive no-progress blocks
 // before the hook releases the session. Exposed as an env var so a fork can
-// tune it; defaults to 8 (the value SPIKE 1 validated against the installed
-// CLI). A non-numeric / non-positive override falls back to the default rather
+// tune it. An explicit CLAUDE_CODE_STOP_HOOK_BLOCK_CAP always wins. With no
+// override the default is RUN-MODE aware:
+//   - autonomous Construction -> 8 (the long ceiling SPIKE 1 validated). An
+//     unattended run has no human to release it, so the loop must run far before
+//     letting go; only a genuine hang should ever hit the cap there.
+//   - interactive (everything else) -> 2. Issue #365 itself recommends
+//     CLAUDE_CODE_STOP_HOOK_BLOCK_CAP=2 as the workaround: a human who pauses or
+//     just chats mid-workflow is released after a single nudge, not eight. A
+//     healthy loop is still never throttled because real progress (a `report`)
+//     changes the signature and resets the counter to 0 well before 2.
+// A non-numeric / non-positive override falls back to the mode default rather
 // than disabling the guard — the guard must never be silently turned off.
-function blockCap(): number {
+function blockCap(stateContent: string): number {
   const raw = process.env.CLAUDE_CODE_STOP_HOOK_BLOCK_CAP;
-  if (!raw) return DEFAULT_BLOCK_CAP;
+  const fallback = defaultBlockCap(stateContent);
+  if (!raw) return fallback;
   const n = Number.parseInt(raw, 10);
-  return Number.isFinite(n) && n > 0 ? n : DEFAULT_BLOCK_CAP;
+  return Number.isFinite(n) && n > 0 ? n : fallback;
 }
-const DEFAULT_BLOCK_CAP = 8;
+
+// The mode-aware default cap (used when no env override is set).
+function defaultBlockCap(stateContent: string): number {
+  return getField(stateContent, "Construction Autonomy Mode")?.trim() === "autonomous"
+    ? AUTONOMOUS_BLOCK_CAP
+    : INTERACTIVE_BLOCK_CAP;
+}
+const AUTONOMOUS_BLOCK_CAP = 8;
+const INTERACTIVE_BLOCK_CAP = 2;
 
 // Upper bound on the `aidlc-orchestrate next` consultation. A `next` that never
 // returns must not hang the hook for the whole turn (a session trap the
@@ -237,7 +273,7 @@ function writeGuard(record: GuardRecord): void {
 // only ever make us release SOONER under a true hang, never trap a live loop.
 // Once the streak reaches the cap we RELEASE: a stuck loop must always let go.
 function decideBlock(stateContent: string, stopHookActive: boolean): boolean {
-  const cap = blockCap();
+  const cap = blockCap(stateContent);
   const signature = progressSignature(stateContent);
   const prior = readGuard();
 
@@ -403,6 +439,324 @@ function isPendingQuestionStop(stateContent: string): boolean {
   }
 }
 
+// --- Tier-2b: pending in-flight compose proposal carve-out --------------------
+//
+// The adaptive composer's IN-FLIGHT approve/edit/reject gate is a turn-stop
+// like a stage gate, but it has no [?]/[R] checkbox signal: the current stage
+// stays [ ]/[-], so this hook's bare-`next` probe sees the pending run-stage
+// and would block the turn - shoving the conductor back into stage execution
+// mid-compose and abandoning the gate (the mid-workflow trap class, reopened
+// for compose). POSITIVE-CONFIRMATION: the conductor writes the marker file
+// `aidlc/.aidlc-compose-pending` before presenting the gate (the engine's
+// compose dispatch print instructs it) and deletes it on approve/reject, the
+// same disk-signal discipline as tier-2's <slug>-questions.md. AUTONOMY GUARD:
+// never fires under autonomous Construction (an unattended run has no human to
+// answer the gate; a stray marker must not strand it). Fail-open: any read
+// error falls through to the cap-bounded block. Front/report composes are
+// unaffected (cold start has no state file; the hook allows before this).
+function isPendingComposeStop(stateContent: string): boolean {
+  try {
+    if (getField(stateContent, "Construction Autonomy Mode")?.trim() === "autonomous") {
+      return false; // autonomy guard - keep the loop alive
+    }
+    return existsSync(join(projectDir, "aidlc", ".aidlc-compose-pending"));
+  } catch {
+    return false;
+  }
+}
+
+// --- Tier-3: conversational-turn carve-out (issue #365 broader reading) -------
+//
+// Issue #365's literal fix is `park` (the conductor explicitly pauses the run).
+// But the reported pain is broader: during an ACTIVE workflow a human who just
+// wants to CHAT (ask a question, discuss a decision, course-correct) should
+// not be nudged back into the forwarding loop at all. Park does not cover that
+// (it is not automatic). This carve-out does: when the turn that is ending was
+// CONVERSATIONAL (the most recent genuine human prompt was answered with NO
+// workflow-engine engagement, i.e. the conductor ran neither aidlc-orchestrate
+// nor aidlc-state since that prompt) we ALLOW the stop.
+//
+// The signal is the harness transcript. Claude and Codex both deliver a
+// `transcript_path` on the Stop payload (Claude JSONL; Codex date-sharded
+// rollout JSONL); Kiro delivers none, so on Kiro this carve-out is simply inert
+// and the run-mode-aware low interactive cap (blockCap) is the safety net that
+// releases a chatting human after one nudge instead of eight.
+//
+// Two strict gates make this safe (it can still only ever ALLOW, never block
+// more), mirroring isPendingQuestionStop:
+//   1. POSITIVE-CONFIRMATION: allow only on a transcript we could read that
+//      shows a genuine human prompt answered with zero engine calls. A missing
+//      path, unreadable file, no human prompt found, or ANY engine call in the
+//      responding turn returns false (fall through to the cap-bounded block).
+//   2. AUTONOMY GUARD: never fires under autonomous Construction. There the
+//      loop must keep running unattended; there is no human chatting to release.
+// Fail-closed throughout: any error returns false and the cap-bounded block stands.
+
+// A workflow-engine tool call: a Bash invocation of aidlc-orchestrate/aidlc-state,
+// or a tool whose name itself references aidlc. These are the calls that mean
+// "the conductor engaged the workflow this turn"; their presence in the turn
+// that answered the human disqualifies the turn from the conversational carve-out
+// (a conductor that ran the engine and then quit mid-loop must still be nudged).
+function isEngineToolCall(name: string, input: unknown): boolean {
+  const cmd =
+    input !== null && typeof input === "object"
+      ? String((input as Record<string, unknown>).command ?? "")
+      : "";
+  // The command text to inspect: a Bash/Shell command, or (for harnesses that
+  // surface the tool by name) the tool name itself.
+  const text = /^(bash|shell|execute_bash)$/i.test(name) ? cmd : name;
+  // Fast reject: no AIDLC engine/state/workspace tool named at all -> not a
+  // workflow engagement (a chat turn that ran git/cat/ls etc.).
+  if (!/aidlc-(orchestrate|state|jump|bolt|swarm)\b/.test(text)) return false;
+  // Split on shell separators so a CHAINED command is judged per sub-command,
+  // not as one blob. Otherwise a read-only flag anywhere in the line
+  // (`... --status && aidlc-orchestrate report ...`) would wrongly exempt a
+  // mutating call elsewhere in the same line. Each segment is judged on its own.
+  const segments = text.split(/&&|\|\||[;|\n]/);
+  for (const seg of segments) {
+    if (isEngineEngagementSegment(seg)) return true;
+  }
+  return false;
+}
+
+// One shell sub-command. True when it ENGAGES the forwarding loop or MUTATES
+// workflow state, false for a read-only query. A human chatting may legitimately
+// ask "what stage am I on?" answered with `--status` / `next --status` /
+// `--doctor` / `--help` / `--version` or a read-only utility call: those must
+// NOT disqualify the conversational carve-out. Anything that advances the loop
+// (`next` fetching a directive, `report` committing a transition) or mutates
+// state (aidlc-state completing/transition verbs; a checkbox/jump/bolt/swarm
+// move) DOES count as engagement. Fail-toward-engagement: an aidlc-orchestrate/
+// state/jump/bolt/swarm verb we do not specifically recognise is treated as
+// engagement (BLOCK), so an unrecognised mutating verb can never leak through as
+// "chat" - the conservative direction for loop integrity.
+function isEngineEngagementSegment(seg: string): boolean {
+  if (!/aidlc-(orchestrate|state|jump|bolt|swarm)\b/.test(seg)) return false;
+  // A PURE read-only query: a read-only flag present AND no mutating/advancing
+  // verb in the SAME segment. `next --status` is read-only; `report --status`
+  // (nonsensical, but) still has `report` so is engagement.
+  const hasReadOnlyFlag = /--status\b|--doctor\b|--help\b|--version\b/.test(seg);
+  if (/aidlc-orchestrate\b/.test(seg)) {
+    const advances = /\bnext\b|\breport\b/.test(seg);
+    if (!advances) return false; // e.g. an orchestrate invocation with only a read-only flag
+    // `next --status` is the read-only status query; a bare `next` (or any
+    // `report`) advances. So: advancing verb present -> engagement UNLESS the
+    // ONLY advancing token is `next` and it carries a read-only flag.
+    if (hasReadOnlyFlag && /\bnext\b/.test(seg) && !/\breport\b/.test(seg)) return false;
+    return true;
+  }
+  if (/aidlc-state\b/.test(seg)) {
+    // The mutating / completing subcommands. (Read-only aidlc-state reads like
+    // `get`/`show` are not here, so they fall through to non-engagement.)
+    return /\b(approve|advance|finalize|complete-workflow|gate-start|checkbox|park|unpark|set|skip|reject|revise|resume)\b/.test(seg);
+  }
+  // aidlc-jump / aidlc-bolt / aidlc-swarm: a read-only query (--help/--status)
+  // is not engagement; anything else mutates (jump moves the pointer, bolt forks/
+  // merges, swarm runs Construction) so counts as engagement.
+  if (hasReadOnlyFlag) return false;
+  return true;
+}
+
+// True when a user-role transcript entry's text is actually the hook's OWN
+// injected continuation (a re-prompt after a block), not the human talking.
+// Two shapes: Claude Code wraps the block reason as "Stop hook feedback: ..."
+// (isMeta:true), but other harnesses (Codex) may re-inject the RAW reason text
+// with no wrapper. continuationReason() (below) always opens with "The AIDLC
+// workflow has a pending step" and names "the forwarding loop", so match either
+// signature. Excluding these is what keeps an engine-engaged turn whose last
+// user entry is the hook's nudge from being misread as a fresh human prompt.
+function isInjectedHookFeedback(text: string): boolean {
+  const t = text.trimStart();
+  return (
+    t.startsWith("Stop hook feedback:") ||
+    (t.startsWith("The AIDLC workflow has a pending step") &&
+      /forwarding loop/.test(t))
+  );
+}
+
+// Read the transcript and classify the ending turn as conversational. Supports
+// both delivered formats; returns true ONLY with positive evidence. `format`
+// distinguishes Claude's message-shaped JSONL from Codex's {type,payload}
+// rollout. Fail-closed on every miss.
+function transcriptIsConversational(transcriptPath: string, format: "claude" | "codex"): boolean {
+  let raw: string;
+  try {
+    raw = readFileSync(transcriptPath, "utf-8");
+  } catch {
+    return false; // unreadable transcript: fall through to the cap
+  }
+  const lines = raw.split("\n");
+  // Parse to a flat sequence of {role, engineCall} events in file order.
+  type Turn = { role: "user" | "assistant"; engineCall: boolean; humanPrompt: boolean };
+  const turns: Turn[] = [];
+  for (const line of lines) {
+    if (line.trim().length === 0) continue;
+    let o: unknown;
+    try {
+      o = JSON.parse(line);
+    } catch {
+      continue; // skip non-JSON / partial lines
+    }
+    if (o === null || typeof o !== "object") continue;
+    const entry = o as Record<string, unknown>;
+    if (format === "claude") {
+      // Claude JSONL: {type:"user"|"assistant", message:{role, content}}.
+      const type = entry.type;
+      const message = entry.message as Record<string, unknown> | undefined;
+      if (!message) continue;
+      const role = message.role;
+      const content = message.content;
+      if (type === "user" && role === "user") {
+        // SKIP synthetic / non-human user turns. Claude Code records several
+        // things as `type:"user"` that are NOT the human talking:
+        //   - `isMeta: true` entries: the Stop hook's OWN injected block-feedback
+        //     ("Stop hook feedback: ...") and command-message wrappers. Counting
+        //     these as a human prompt would let the hook's own nudge masquerade
+        //     as the human, so an engine-engaged turn could be misread as chat.
+        //   - tool_result arrays: a tool's output, not a prompt.
+        // Both must be excluded so "the most recent genuine human prompt" is the
+        // human, not the harness.
+        if (entry.isMeta === true) continue;
+        const isToolResult =
+          Array.isArray(content) &&
+          content.some((x) => (x as Record<string, unknown>)?.type === "tool_result");
+        if (isToolResult) continue; // a tool_result is not a human prompt
+        // Defence-in-depth: the hook's continuation text is injected as a user
+        // turn; exclude it by content even if a future build drops `isMeta`.
+        const asText =
+          typeof content === "string"
+            ? content
+            : Array.isArray(content)
+              ? content
+                  .map((x) => {
+                    const b = x as Record<string, unknown>;
+                    return b?.type === "text" ? String(b.text ?? "") : "";
+                  })
+                  .join("")
+              : "";
+        if (isInjectedHookFeedback(asText)) continue;
+        // A genuine human prompt: string content, or an array with a text block.
+        const isHuman =
+          typeof content === "string" ||
+          (Array.isArray(content) &&
+            content.some((x) => (x as Record<string, unknown>)?.type === "text"));
+        if (isHuman) turns.push({ role: "user", engineCall: false, humanPrompt: true });
+      } else if (type === "assistant" && role === "assistant" && Array.isArray(content)) {
+        let engineCall = false;
+        for (const block of content) {
+          const b = block as Record<string, unknown>;
+          if (b?.type === "tool_use" && isEngineToolCall(String(b.name ?? ""), b.input)) {
+            engineCall = true;
+            break;
+          }
+        }
+        turns.push({ role: "assistant", engineCall, humanPrompt: false });
+      }
+    } else {
+      // Codex rollout JSONL: {type:"response_item", payload:{type, role, content,
+      // name, ...}}. function_call entries carry the tool name/arguments.
+      const payload = entry.payload as Record<string, unknown> | undefined;
+      if (entry.type !== "response_item" || !payload) continue;
+      const ptype = payload.type;
+      if (ptype === "message" && payload.role === "user") {
+        // input_text blocks are the human prompt; tool output rides function_call_output.
+        const content = payload.content;
+        // Exclude the hook's own injected continuation (delivered as a user
+        // message on a re-prompt) so it is not mistaken for the human, mirroring
+        // the Claude reader's `Stop hook feedback:` guard.
+        const asText =
+          typeof content === "string"
+            ? content
+            : Array.isArray(content)
+              ? content
+                  .map((x) => {
+                    const b = x as Record<string, unknown>;
+                    return b?.type === "input_text" || b?.type === "text" ? String(b.text ?? "") : "";
+                  })
+                  .join("")
+              : "";
+        if (isInjectedHookFeedback(asText)) continue;
+        const isHuman =
+          typeof content === "string" ||
+          (Array.isArray(content) &&
+            content.some((x) => {
+              const t = (x as Record<string, unknown>)?.type;
+              return t === "input_text" || t === "text";
+            }));
+        if (isHuman) turns.push({ role: "user", engineCall: false, humanPrompt: true });
+      } else if (ptype === "message" && payload.role === "assistant") {
+        turns.push({ role: "assistant", engineCall: false, humanPrompt: false });
+      } else if (ptype === "function_call" || ptype === "local_shell_call") {
+        const name = String(payload.name ?? (ptype === "local_shell_call" ? "Shell" : ""));
+        const args = payload.arguments ?? payload.action ?? {};
+        // function_call arguments are a JSON string on Codex; parse leniently.
+        let parsedArgs: Record<string, unknown> = {};
+        if (typeof args === "string") {
+          try {
+            const j = JSON.parse(args);
+            parsedArgs = j !== null && typeof j === "object" ? (j as Record<string, unknown>) : { command: args };
+          } catch {
+            parsedArgs = { command: args };
+          }
+        } else if (args !== null && typeof args === "object") {
+          parsedArgs = args as Record<string, unknown>;
+        }
+        // Normalise the command field so isEngineToolCall sees the full command
+        // text (Codex may key it `command`, or carry it as the raw arguments
+        // string). Routing it ALL through isEngineToolCall keeps the read-only
+        // exemption (--status etc.) consistent across both transcript formats,
+        // rather than a loose regex that would re-flag a read-only query.
+        if (typeof parsedArgs.command !== "string") {
+          parsedArgs = { ...parsedArgs, command: typeof args === "string" ? args : JSON.stringify(args) };
+        }
+        const engineCall = isEngineToolCall(
+          /^(bash|shell|execute_bash|local_shell_call)$/i.test(name) ? "Bash" : name,
+          parsedArgs,
+        );
+        turns.push({ role: "assistant", engineCall, humanPrompt: false });
+      }
+    }
+  }
+
+  // Find the most recent genuine human prompt.
+  let lastHumanIdx = -1;
+  for (let i = turns.length - 1; i >= 0; i--) {
+    if (turns[i].humanPrompt) {
+      lastHumanIdx = i;
+      break;
+    }
+  }
+  if (lastHumanIdx === -1) return false; // no human prompt found: cannot confirm chat
+
+  // Any engine call AFTER that prompt means the conductor engaged the workflow;
+  // a mid-loop bail must still be nudged. Zero engine calls -> conversational.
+  for (let i = lastHumanIdx + 1; i < turns.length; i++) {
+    if (turns[i].engineCall) return false;
+  }
+  return true;
+}
+
+// The tier-3 carve-out decision: not autonomous, a transcript was delivered, and
+// it shows a conversational ending turn. `transcriptPath`/`format` come from the
+// Stop payload (Claude / Codex); both are absent on Kiro, where this returns
+// false and the low interactive cap handles the chat case instead.
+function isConversationalStop(
+  stateContent: string,
+  transcriptPath: string | null,
+  format: "claude" | "codex",
+): boolean {
+  try {
+    if (getField(stateContent, "Construction Autonomy Mode")?.trim() === "autonomous") {
+      return false; // autonomy guard: keep the loop alive
+    }
+    if (transcriptPath === null || transcriptPath.length === 0) return false;
+    return transcriptIsConversational(transcriptPath, format);
+  } catch {
+    // Unparseable / odd content: fall through to decideBlock (never trap).
+    return false;
+  }
+}
+
 // --- Compose the engine -------------------------------------------------------
 //
 // Run `aidlc-orchestrate.ts next` and return its parsed directive kind, or null
@@ -457,7 +811,10 @@ function continuationReason(kind: string, stage: string): string {
     "You haven't finished the forwarding loop yet. Run " +
     `\`bun ${harnessDir()}/tools/aidlc-orchestrate.ts next\`, act on the directive it ` +
     "emits, then run `aidlc-orchestrate report --stage <stage> --result <outcome>` to commit " +
-    "the transition. Repeat until the engine answers `done`."
+    "the transition. Repeat until the engine answers `done`. " +
+    "If instead you mean to pause this workflow for now (and resume in a later " +
+    `session), run \`bun ${harnessDir()}/tools/aidlc-orchestrate.ts park\` to park it ` +
+    "cleanly at this inter-stage boundary - never mark stages complete just to end the turn."
   );
 }
 
@@ -485,17 +842,33 @@ try {
 }
 
 // Parse the Stop-hook input. Garbage / empty stdin must NOT crash and must NOT
-// trap the turn — fail open. We only read stop_hook_active off it.
+// trap the turn (fail open). We read `stop_hook_active` (the recursion bound)
+// and `transcript_path` (the conversational carve-out, tier 3). Claude and Codex
+// both deliver `transcript_path`; Kiro delivers neither, so transcriptPath stays
+// null there and the conversational carve-out is inert (the low interactive cap
+// handles chat instead).
 let stopHookActive = false;
+let transcriptPath: string | null = null;
+// Transcript format: Codex's rollout JSONL lives under a `.../sessions/<date>/
+// rollout-*.jsonl` path and uses a {type,payload} shape; Claude's is message-
+// shaped JSONL. Default to Claude; switch to Codex when the path looks like a
+// Codex rollout. (Both readers fail-closed, so a misclassification can only ever
+// return false and fall through to the cap, never a false allow.)
+let transcriptFormat: "claude" | "codex" = "claude";
 try {
   const raw: unknown = JSON.parse(input);
-  if (raw !== null && typeof raw === "object" && "stop_hook_active" in raw) {
-    stopHookActive = (raw as { stop_hook_active: unknown }).stop_hook_active === true;
+  if (raw !== null && typeof raw === "object") {
+    const obj = raw as Record<string, unknown>;
+    if ("stop_hook_active" in obj) stopHookActive = obj.stop_hook_active === true;
+    if (typeof obj.transcript_path === "string" && obj.transcript_path.length > 0) {
+      transcriptPath = obj.transcript_path;
+      if (/[/\\]rollout-[^/\\]*\.jsonl$/.test(transcriptPath)) transcriptFormat = "codex";
+    }
   }
 } catch {
-  // Malformed JSON (or empty) — proceed with stopHookActive=false. The engine
-  // read below still governs whether work is pending; the counter still bounds
-  // any block. We never crash on bad input.
+  // Malformed JSON (or empty): proceed with stopHookActive=false and no
+  // transcript. The engine read below still governs whether work is pending; the
+  // counter still bounds any block. We never crash on bad input.
 }
 
 // Consult the engine for the next move. A null kind (engine unavailable /
@@ -511,6 +884,34 @@ if (kind === null) {
 if (kind === "done") {
   resetGuard();
   allowStop();
+}
+
+// `parked` -> the workflow was intentionally parked mid-flow (issue #367); a
+// human resumes it later with /aidlc --resume. This is the SUPPORTED
+// multi-session exit: allow the turn to end and clear the guard exactly like
+// `done`, so the conductor parks at a clean inter-stage boundary instead of
+// rubber-stamping the remaining stages to force a `done`. Terminal allow only
+// (never a new block), so it can never trap a session.
+//
+// AUTONOMY GUARD (salvaged from the #365 suspend branch): an unattended
+// autonomous Construction run (`Construction Autonomy Mode: autonomous`) MUST
+// keep moving and never self-park. There is no human to resume it later, so a
+// park would strand the swarm/Bolt run waiting on someone who was told they
+// weren't needed. When autonomous, decline the parked allow and fall through to
+// the cap-bounded block below (the loop stays alive; a genuine hang still
+// releases via the no-progress cap). This mirrors isPendingQuestionStop's
+// identical guard (:391) for consistency across every carve-out in this hook.
+if (kind === "parked") {
+  if (getField(stateContent, "Construction Autonomy Mode")?.trim() === "autonomous") {
+    recordHookDrop(
+      projectDir,
+      HOOK_NAME,
+      "parked directive seen under autonomous Construction; declining the parked allow (an unattended run must not self-park), falling through to the cap-bounded block",
+    );
+  } else {
+    resetGuard();
+    allowStop();
+  }
 }
 
 // `ask` → the engine is explicitly waiting for human input (resume re-entry or
@@ -555,6 +956,41 @@ if (isPendingQuestionStop(stateContent)) {
   allowStop();
 }
 
+// Pending-compose carve-out (tier 2b): an in-flight compose proposal is
+// awaiting the human's approve/edit/reject (the conductor's marker file is on
+// disk) and we are NOT in autonomous Construction - the conductor is parked on
+// the human exactly like a stage gate, so allow the turn to end instead of
+// nudging it back into stage execution mid-compose. Positive-confirmation only
+// (the marker), autonomy-guarded, fail-open (see isPendingComposeStop).
+if (isPendingComposeStop(stateContent)) {
+  recordHookDrop(
+    projectDir,
+    HOOK_NAME,
+    "an in-flight compose proposal is pending human approval (aidlc/.aidlc-compose-pending present); allowing the stop (pending-compose carve-out)",
+  );
+  allowStop();
+}
+
+// Conversational carve-out (tier 3, issue #365 broader reading): the ending turn
+// answered the human's most recent prompt with NO workflow-engine engagement, so
+// the human was just chatting mid-workflow, allow the stop instead of nudging
+// them back into the loop. Reads the harness transcript (Claude / Codex deliver
+// `transcript_path`; Kiro delivers none, so this is inert there and the low
+// interactive cap below releases a chatting human after one nudge). Strictly
+// gated and fail-closed (see isConversationalStop): no transcript, no human
+// prompt, ANY engine call in the responding turn, an autonomous run, or any read
+// error falls through to the cap-bounded block below, so a conductor that
+// engaged the workflow and then quit mid-loop (and every autonomous run) is
+// still nudged.
+if (isConversationalStop(stateContent, transcriptPath, transcriptFormat)) {
+  recordHookDrop(
+    projectDir,
+    HOOK_NAME,
+    "the ending turn was conversational (human's last prompt answered with no workflow-engine call); allowing the stop (conversational carve-out)",
+  );
+  allowStop();
+}
+
 // A directive is PENDING (run-stage / dispatch-subagent / invoke-swarm /
 // present-gate / ask / print / error). Decide whether to block, honouring the
 // recursion bounds. When the bounds say release, LET GO — a stuck loop must
@@ -564,7 +1000,7 @@ if (!shouldBlock) {
   recordHookDrop(
     projectDir,
     HOOK_NAME,
-    `recursion guard released the stop (no-progress block cap ${blockCap()} reached; stop_hook_active=${stopHookActive})`,
+    `recursion guard released the stop (no-progress block cap ${blockCap(stateContent)} reached; stop_hook_active=${stopHookActive})`,
   );
   allowStop();
 }

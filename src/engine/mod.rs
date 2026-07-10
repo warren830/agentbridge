@@ -640,8 +640,11 @@ async fn handle_message(
     }
 
     // Try to acquire the session lock (explicit, not RAII guard).
+    // `locked=false` already implies the session was busy; logging is_busy()
+    // AFTER a successful lock always prints true (we just took it), which read
+    // like a contended session in the logs.
     let locked = session.try_lock_explicit();
-    tracing::info!(session = %&session.id[..8], locked, busy = session.is_busy(), "try_lock result");
+    tracing::info!(session = %&session.id[..8], locked, "try_lock result");
 
     if !locked {
         // Check for /btw — inject mid-turn message into running agent

@@ -169,7 +169,11 @@ async fn handle_hook_event(
         .registry
         .resolve(payload.tmux_session.as_deref(), payload.cwd.as_deref())
     else {
-        tracing::warn!(
+        // Debug, not warn: the globally-installed hook makes EVERY Claude Code
+        // instance on the host post here, so unmatched drops are steady-state
+        // noise, not a fault (observed: 21 drops in 6 minutes from unrelated
+        // sessions). Bump RUST_LOG to debug when chasing a lost reply.
+        tracing::debug!(
             tmux_session = payload.tmux_session.as_deref().unwrap_or(""),
             cwd = payload.cwd.as_deref().unwrap_or(""),
             event = payload.hook_event_name.as_deref().unwrap_or(""),

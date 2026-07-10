@@ -27,14 +27,22 @@ import urllib.request
 
 def _tmux_session() -> str:
     # Resolve the tmux session this cc runs in. $TMUX being set means we're
-    # inside tmux; `display-message -p '#S'` then resolves the session via the
-    # attached client. Best-effort: any failure yields "" and the receiver
-    # falls back to cwd matching.
+    # inside tmux. Target the query at $TMUX_PANE (the pane this hook runs
+    # in): a bare `display-message -p '#S'` resolves via the most recently
+    # active attached client, which can name a DIFFERENT session when several
+    # sessions/clients exist — misrouting the hook and silently dropping the
+    # reply. Best-effort: any failure yields "" and the receiver falls back
+    # to cwd matching.
     if not os.environ.get("TMUX", "").strip():
         return ""
     try:
+        cmd = ["tmux", "display-message", "-p"]
+        pane = os.environ.get("TMUX_PANE", "").strip()
+        if pane:
+            cmd += ["-t", pane]
+        cmd.append("#S")
         out = subprocess.run(
-            ["tmux", "display-message", "-p", "#S"],
+            cmd,
             capture_output=True, text=True, timeout=2,
         )
         return out.stdout.strip()

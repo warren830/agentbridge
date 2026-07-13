@@ -61,3 +61,4 @@ aidlc/spaces/*/intents/*/.aidlc-*
 # which was proven to corrupt the multi-line audit blocks) ·
 # aidlc/spaces/*/intents/*/<phase>/<stage>/*.md (artifacts + diary).
 .claude/settings.local.json
+.gstack/

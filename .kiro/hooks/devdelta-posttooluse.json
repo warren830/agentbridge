@@ -1,0 +1,14 @@
+{
+ "version": "v1",
+ "hooks": [
+  {
+   "name": "devdelta-posttooluse",
+   "trigger": "PostToolUse",
+   "action": {
+    "type": "command",
+    "command": "/Users/ychchen/warren_ws/DevDelta/bin/devdelta hook"
+   },
+   "timeout_ms": 5000
+  }
+ ]
+}

@@ -2,6 +2,9 @@
 //!
 //! Config lives at ~/.agentbridge/config.yaml by default.
 
+pub mod check;
+pub mod validation;
+
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -449,81 +452,12 @@ pub fn load(path: Option<&str>) -> Result<AppConfig> {
     Ok(config)
 }
 
+/// Apply the semantic rules in [`validation`] and render the verbose message.
+///
+/// The rules themselves live in `validation` so the offline `config check`
+/// command can report the same verdict without the value-bearing text.
 fn validate(config: &AppConfig) -> Result<()> {
-    if config.projects.is_empty() {
-        anyhow::bail!("No projects configured. Add at least one [[projects]] entry.");
-    }
-
-    for p in &config.projects {
-        if p.name.is_empty() {
-            anyhow::bail!("Project name cannot be empty");
-        }
-        if p.platforms.is_empty() {
-            anyhow::bail!("Project '{}' has no platforms configured", p.name);
-        }
-        validate_agents(p)?;
-    }
-
-    Ok(())
-}
-
-fn validate_agents(project: &ProjectConfig) -> Result<()> {
-    let has_old_agent = project.agent.mode != default_mode()
-        || project.agent.model.is_some()
-        || !project.agent.allowed_tools.is_empty()
-        || project.agent.max_turns.is_some();
-    let has_new_agents = !project.agents.is_empty();
-
-    if has_old_agent && has_new_agents {
-        anyhow::bail!(
-            "Project '{}': cannot have both 'agent' and 'agents' fields. \
-             Remove the old 'agent:' field and use 'agents:' instead.",
-            project.name
-        );
-    }
-
-    if has_new_agents {
-        let mut seen_names = std::collections::HashSet::new();
-        for entry in &project.agents {
-            if entry.name.is_empty() {
-                anyhow::bail!("Project '{}': agent name cannot be empty", project.name);
-            }
-            if !seen_names.insert(&entry.name) {
-                anyhow::bail!(
-                    "Project '{}': duplicate agent name '{}'",
-                    project.name,
-                    entry.name
-                );
-            }
-            if entry.backend == "acp" && entry.acp.is_none() {
-                anyhow::bail!(
-                    "Project '{}': agent '{}' has backend 'acp' but no 'acp:' config",
-                    project.name,
-                    entry.name
-                );
-            }
-            if entry.backend == "tmux" && entry.tmux.is_none() {
-                anyhow::bail!(
-                    "Project '{}': agent '{}' has backend 'tmux' but no 'tmux:' config",
-                    project.name,
-                    entry.name
-                );
-            }
-        }
-
-        if let Some(ref default_name) = project.default_agent {
-            if !project.agents.iter().any(|a| a.name == *default_name) {
-                anyhow::bail!(
-                    "Project '{}': default_agent '{}' not found in agents list. Available: {}",
-                    project.name,
-                    default_name,
-                    project.agents.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", ")
-                );
-            }
-        }
-    }
-
-    Ok(())
+    validation::validate_config(config).map_err(|issue| anyhow::anyhow!(issue.detail().to_string()))
 }
 
 #[cfg(test)]

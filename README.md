@@ -270,6 +270,7 @@ agentbridge                    Start the bridge (foreground)
 agentbridge run                Same as above
 agentbridge init               Interactive setup wizard
 agentbridge doctor             Check configuration health
+agentbridge config check       Validate the config offline (see below)
 agentbridge daemon install     Install as a systemd user service
 agentbridge daemon start       Start the background service
 agentbridge daemon stop        Stop the background service
@@ -277,6 +278,75 @@ agentbridge daemon status      Show service status
 agentbridge daemon logs        Tail service logs
 agentbridge daemon uninstall   Remove the service
 ```
+
+### Offline config check
+
+`config check` answers one question — *is this config file loadable?* — using the
+same parsing and validation as startup, and nothing else:
+
+```bash
+agentbridge --config ./config.yaml config check
+agentbridge --config ./config.yaml config check --json
+```
+
+It performs no network calls, does not look for `claude`/`kiro-cli` on PATH,
+never writes files and starts no background service. Placeholder platform
+tokens, agent executables that only exist on the deployment host and `work_dir`
+paths that do not exist locally all pass — which is what makes it usable in CI
+and pre-commit hooks. Use `doctor` instead when you want the host checked too
+(binaries on PATH, ACP command reachability).
+
+**Exit codes**
+
+| Code | Meaning |
+|------|---------|
+| `0` | Config parsed and passed every validation rule |
+| `1` | Config error: file missing or unreadable, malformed YAML, a field of the wrong type, or a semantic problem (no projects, project without platforms, duplicate agent name, `default_agent` not in `agents`, `backend: acp`/`tmux` without its section, both `agent:` and `agents:`) |
+
+**JSON output**
+
+With `--json`, stdout is exactly one JSON object — for the valid and the invalid
+outcome alike — and every key is always present:
+
+```json
+{
+  "schema": "agentbridge.config-check.v1",
+  "valid": true,
+  "config_path": "/home/you/.agentbridge/config.yaml",
+  "projects": 2,
+  "error": null
+}
+```
+
+```json
+{
+  "schema": "agentbridge.config-check.v1",
+  "valid": false,
+  "config_path": "./config.yaml",
+  "projects": 1,
+  "error": {
+    "kind": "duplicate_agent_name",
+    "location": "projects[0].agents[1].name",
+    "message": "duplicate agent name within a project"
+  }
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `schema` | string | Always `agentbridge.config-check.v1`. Pin it; a breaking change bumps the version |
+| `valid` | bool | `true` only when the file parsed and all rules passed |
+| `config_path` | string | The path that was checked (from `--config`, else the default). Comes from the invocation, not from inside the file |
+| `projects` | number | Projects parsed; `0` when the file could not be read or parsed |
+| `error` | object \| null | `null` when `valid` is `true`, otherwise the diagnostic below |
+| `error.kind` | string | `config_not_found`, `config_unreadable`, `invalid_yaml`, `no_projects`, `empty_project_name`, `no_platforms`, `agent_and_agents_conflict`, `empty_agent_name`, `duplicate_agent_name`, `missing_acp_config`, `missing_tmux_config`, `unknown_default_agent` |
+| `error.location` | string \| null | Where, never what: `line 2, column 9` for parse failures, `projects[0].agents[1].acp` for semantic ones, `null` when there is no position |
+| `error.message` | string | Fixed sentence for `kind` |
+
+The report is safe to log or ship to a dashboard: diagnostics carry only the kind
+and a structural location, so no token, secret or value from inside the config is
+ever echoed — not even by malformed-YAML or wrong-type errors, whose underlying
+parser message quotes the offending scalar.
 
 ---
 

@@ -60,6 +60,11 @@ enum Commands {
     Init,
     /// Check configuration health
     Doctor,
+    /// Offline configuration commands
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
     /// Install the Claude Code Stop/PostToolUse hook into ~/.claude/settings.json
     HookInstall {
         /// Port the hook receiver listens on (must match config; default 9123)
@@ -95,6 +100,16 @@ enum Commands {
         /// Directory with static files (Nuxt build output)
         #[arg(long)]
         static_dir: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigAction {
+    /// Validate the config file offline: no network, no agent lookup, no writes
+    Check {
+        /// Print a single machine-readable JSON object instead of text
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -161,6 +176,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Init => run_init().await,
         Commands::Doctor => run_doctor(cli.config).await,
+        Commands::Config { action } => match action {
+            ConfigAction::Check { json } => run_config_check(cli.config, json),
+        },
         Commands::HookInstall { port } => run_hook_install(cli.config, port).await,
         Commands::Daemon { action } => run_daemon(action),
         Commands::Relay { action } => run_relay(action).await,
@@ -812,6 +830,28 @@ fn prompt_input(prompt: &str) -> anyhow::Result<String> {
     Ok(input.trim().to_string())
 }
 
+/// Offline config validation. Prints one report and exits 0 when the config is
+/// valid, 1 for every config error (missing or unreadable file, malformed YAML
+/// or wrong field types, semantic problems). With `--json` the report is exactly
+/// one JSON object on stdout for either outcome, so CI can parse it blindly.
+///
+/// Nothing here touches the network, looks for agent executables, writes files
+/// or starts a service: the check is about the file, not about the host.
+fn run_config_check(config_path: Option<String>, json: bool) -> anyhow::Result<()> {
+    let report = config::check::check(config_path.as_deref());
+
+    if json {
+        println!("{}", report.to_json()?);
+    } else {
+        print!("{}", report.to_text());
+    }
+
+    if !report.valid {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
 async fn run_doctor(config_path: Option<String>) -> anyhow::Result<()> {
     println!("agentbridge doctor\n");
 
@@ -1129,5 +1169,58 @@ mod hook_install_tests {
         let cmd = "python3 /h/agentbridge_hook.py 9123";
         assert!(!merge_hook_event(&mut settings, "Stop", cmd));
         assert!(settings["hooks"].is_array(), "foreign shape preserved");
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    use clap::Parser;
+
+    fn parse(args: &[&str]) -> Cli {
+        Cli::try_parse_from(args).expect("args should parse")
+    }
+
+    #[test]
+    fn config_check_accepts_global_config_before_subcommand() {
+        let cli = parse(&["agentbridge", "--config", "/tmp/c.yaml", "config", "check"]);
+        assert_eq!(cli.config.as_deref(), Some("/tmp/c.yaml"));
+        match cli.command {
+            Some(Commands::Config {
+                action: ConfigAction::Check { json },
+            }) => assert!(!json, "json must default to off"),
+            _ => panic!("expected config check"),
+        }
+    }
+
+    #[test]
+    fn config_check_accepts_json_flag() {
+        let cli = parse(&["agentbridge", "config", "check", "--json"]);
+        match cli.command {
+            Some(Commands::Config {
+                action: ConfigAction::Check { json },
+            }) => assert!(json),
+            _ => panic!("expected config check"),
+        }
+    }
+
+    #[test]
+    fn config_check_accepts_trailing_config_path() {
+        // `--config` is global, so it may also follow the subcommand.
+        let cli = parse(&[
+            "agentbridge",
+            "config",
+            "check",
+            "--json",
+            "--config",
+            "/tmp/c.yaml",
+        ]);
+        assert_eq!(cli.config.as_deref(), Some("/tmp/c.yaml"));
+    }
+
+    #[test]
+    fn config_requires_a_known_action() {
+        assert!(Cli::try_parse_from(["agentbridge", "config"]).is_err());
+        assert!(Cli::try_parse_from(["agentbridge", "config", "lint"]).is_err());
     }
 }

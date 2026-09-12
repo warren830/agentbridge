@@ -281,7 +281,7 @@ agentbridge daemon uninstall   Remove the service
 
 ### Offline config check
 
-`config check` answers one question — *is this config file loadable?* — using the
+`config check` answers one question — *is this config loadable?* — using the
 same parsing and validation as startup, and nothing else:
 
 ```bash
@@ -296,12 +296,38 @@ paths that do not exist locally all pass — which is what makes it usable in CI
 and pre-commit hooks. Use `doctor` instead when you want the host checked too
 (binaries on PATH, ACP command reachability).
 
+**Checking piped config (`--stdin`)**
+
+`--stdin` reads the config from standard input, so a pipeline can validate YAML
+it just generated without writing a temporary file:
+
+```bash
+# validate generated config without touching disk
+render-config | agentbridge config check --stdin
+
+# gate a CI step on the machine-readable verdict
+render-config | agentbridge config check --stdin --json | jq -e '.valid'
+
+# check a file without letting agentbridge resolve the path
+cat ./config.yaml | agentbridge config check --stdin
+```
+
+Rules, diagnostics and exit codes are identical to the file path; only
+`config_path` differs, reading `<stdin>`. The default path is never consulted, so
+a broken `~/.agentbridge/config.yaml` cannot influence the verdict.
+
+`--stdin` combines with `--json` but is mutually exclusive with an explicit
+`--config` (in either order — `--config` is a global flag): serving one would
+silently ignore the other, so the invocation is rejected as a usage error
+instead. Empty, malformed and non-UTF-8 input all fail as config errors.
+
 **Exit codes**
 
 | Code | Meaning |
 |------|---------|
 | `0` | Config parsed and passed every validation rule |
-| `1` | Config error: file missing or unreadable, malformed YAML, a field of the wrong type, or a semantic problem (no projects, project without platforms, duplicate agent name, `default_agent` not in `agents`, `backend: acp`/`tmux` without its section, both `agent:` and `agents:`) |
+| `1` | Config error: input missing or unreadable (including non-UTF-8), malformed YAML, a field of the wrong type, or a semantic problem (no projects, project without platforms, duplicate agent name, `default_agent` not in `agents`, `backend: acp`/`tmux` without its section, both `agent:` and `agents:`) |
+| `2` | Usage error, e.g. `--stdin` combined with `--config`. No report is printed — stdout stays empty even with `--json` |
 
 **JSON output**
 
@@ -335,9 +361,9 @@ outcome alike — and every key is always present:
 | Field | Type | Description |
 |-------|------|-------------|
 | `schema` | string | Always `agentbridge.config-check.v1`. Pin it; a breaking change bumps the version |
-| `valid` | bool | `true` only when the file parsed and all rules passed |
-| `config_path` | string | The path that was checked (from `--config`, else the default). Comes from the invocation, not from inside the file |
-| `projects` | number | Projects parsed; `0` when the file could not be read or parsed |
+| `valid` | bool | `true` only when the config parsed and all rules passed |
+| `config_path` | string | What was checked: the path (from `--config`, else the default), or `<stdin>` under `--stdin`. Comes from the invocation, not from inside the config |
+| `projects` | number | Projects parsed; `0` when the config could not be read or parsed |
 | `error` | object \| null | `null` when `valid` is `true`, otherwise the diagnostic below |
 | `error.kind` | string | `config_not_found`, `config_unreadable`, `invalid_yaml`, `no_projects`, `empty_project_name`, `no_platforms`, `agent_and_agents_conflict`, `empty_agent_name`, `duplicate_agent_name`, `missing_acp_config`, `missing_tmux_config`, `unknown_default_agent` |
 | `error.location` | string \| null | Where, never what: `line 2, column 9` for parse failures, `projects[0].agents[1].acp` for semantic ones, `null` when there is no position |
@@ -345,8 +371,8 @@ outcome alike — and every key is always present:
 
 The report is safe to log or ship to a dashboard: diagnostics carry only the kind
 and a structural location, so no token, secret or value from inside the config is
-ever echoed — not even by malformed-YAML or wrong-type errors, whose underlying
-parser message quotes the offending scalar.
+ever echoed — not even by malformed-YAML, wrong-type or non-UTF-8 input, whose
+underlying parser message quotes the offending scalar.
 
 ---
 

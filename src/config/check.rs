@@ -1,17 +1,19 @@
 //! Offline config check behind `agentbridge config check`.
 //!
-//! The check is deliberately inert: it reads one file, parses it, and applies
-//! the same semantic rules as [`super::load`]. It never touches the network,
-//! never looks for agent executables, never writes anything, and never starts a
-//! service — so it is safe in CI with placeholder platform tokens, absent agent
-//! binaries and work dirs that only exist on the deployment host.
+//! The check is deliberately inert: it reads one config (a file, or standard
+//! input with `--stdin`), parses it, and applies the same semantic rules as
+//! [`super::load`]. It never touches the network, never looks for agent
+//! executables, never writes anything, and never starts a service — so it is
+//! safe in CI with placeholder platform tokens, absent agent binaries and work
+//! dirs that only exist on the deployment host.
 //!
 //! Every diagnostic is value-free by construction (see [`CheckErrorKind`]):
 //! kinds are fixed sentences and locations are field names plus indices, so a
 //! report can be logged or shipped to a dashboard without leaking tokens,
 //! secrets or paths from inside the config.
 
-use std::path::{Path, PathBuf};
+use std::io::Read;
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
@@ -21,18 +23,25 @@ use super::AppConfig;
 /// Schema identifier emitted with every report so consumers can pin a shape.
 pub const SCHEMA: &str = "agentbridge.config-check.v1";
 
+/// Value of `config_path` when the YAML was piped in instead of read from a
+/// file. A fixed sentinel, so a report from a pipeline is still self-describing
+/// without inventing a path that does not exist.
+pub const STDIN_INPUT: &str = "<stdin>";
+
 /// Machine-readable outcome. Exactly one of these is printed per invocation,
 /// for both the valid and the invalid outcome; all fields are always present.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckReport {
     /// Always [`SCHEMA`].
     pub schema: String,
-    /// True only when the file parsed and every semantic rule passed.
+    /// True only when the config parsed and every semantic rule passed.
     pub valid: bool,
-    /// Config file the check resolved, from `--config` or the default path.
-    /// Comes from the invocation, not from inside the file.
+    /// Config the check resolved: the path from `--config`, the default path,
+    /// or [`STDIN_INPUT`] under `--stdin`. Comes from the invocation, not from
+    /// inside the config.
     pub config_path: String,
-    /// Number of projects parsed. Zero when the file could not be read/parsed.
+    /// Number of projects parsed. Zero when the config could not be
+    /// read/parsed.
     pub projects: usize,
     /// `null` when valid, otherwise the safe diagnostic.
     pub error: Option<CheckError>,
@@ -50,8 +59,8 @@ pub struct CheckError {
     pub message: String,
 }
 
-/// Failure categories. The first three cover reaching and parsing the file; the
-/// rest mirror [`IssueKind`] one-for-one.
+/// Failure categories. The first three cover reaching and parsing the input;
+/// the rest mirror [`IssueKind`] one-for-one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckErrorKind {
@@ -108,18 +117,18 @@ impl From<IssueKind> for CheckErrorKind {
 }
 
 impl CheckReport {
-    fn valid(path: &Path, projects: usize) -> Self {
+    fn valid(input: &str, projects: usize) -> Self {
         Self {
             schema: SCHEMA.to_string(),
             valid: true,
-            config_path: path.display().to_string(),
+            config_path: input.to_string(),
             projects,
             error: None,
         }
     }
 
     fn invalid(
-        path: &Path,
+        input: &str,
         projects: usize,
         kind: CheckErrorKind,
         location: Option<String>,
@@ -127,7 +136,7 @@ impl CheckReport {
         Self {
             schema: SCHEMA.to_string(),
             valid: false,
-            config_path: path.display().to_string(),
+            config_path: input.to_string(),
             projects,
             error: Some(CheckError {
                 kind,
@@ -174,6 +183,7 @@ pub fn check(path: Option<&str>) -> CheckReport {
     let config_path: PathBuf = path
         .map(PathBuf::from)
         .unwrap_or_else(super::default_config_path);
+    let input = config_path.display().to_string();
 
     // read_to_string covers "missing" and "unreadable" (permissions, a
     // directory in place of the file, non-UTF-8 bytes) in one syscall, so a
@@ -186,32 +196,72 @@ pub fn check(path: Option<&str>) -> CheckReport {
             } else {
                 CheckErrorKind::ConfigUnreadable
             };
-            return CheckReport::invalid(&config_path, 0, kind, None);
+            return CheckReport::invalid(&input, 0, kind, None);
         }
     };
 
-    let config: AppConfig = match serde_yaml::from_str(&content) {
+    check_content(&input, &content)
+}
+
+/// Validate the config on standard input — the `--stdin` path, for CI and shell
+/// pipelines that generate YAML and never want it on disk.
+pub fn check_stdin() -> CheckReport {
+    check_reader(std::io::stdin().lock())
+}
+
+/// Validate config YAML read from `reader`, reported as [`STDIN_INPUT`].
+///
+/// Same rules and same value-free diagnostics as [`check`]; only where the
+/// bytes come from differs. Decoding happens up front so non-UTF-8 input is
+/// reported exactly like a non-UTF-8 file — unreadable, with no location — and
+/// the undecodable bytes are dropped rather than echoed.
+pub fn check_reader<R: Read>(mut reader: R) -> CheckReport {
+    let mut bytes = Vec::new();
+    if reader.read_to_end(&mut bytes).is_err() {
+        return CheckReport::invalid(
+            STDIN_INPUT,
+            0,
+            CheckErrorKind::ConfigUnreadable,
+            None,
+        );
+    }
+
+    let content = match String::from_utf8(bytes) {
+        Ok(content) => content,
+        Err(_) => {
+            return CheckReport::invalid(
+                STDIN_INPUT,
+                0,
+                CheckErrorKind::ConfigUnreadable,
+                None,
+            )
+        }
+    };
+
+    check_content(STDIN_INPUT, &content)
+}
+
+/// Parse and validate already-read YAML. The single place the rules live, so a
+/// piped config cannot drift from a file one; `input` is only a report label.
+fn check_content(input: &str, content: &str) -> CheckReport {
+    let config: AppConfig = match serde_yaml::from_str(content) {
         Ok(config) => config,
         Err(e) => {
             // serde_yaml's message quotes the offending scalar ("invalid type:
             // string \"abc\"") and would leak config values, so only the
-            // position survives.
+            // position survives. Empty input lands here too (EOF while parsing
+            // a value), with no position to report.
             let location = e
                 .location()
                 .map(|l| format!("line {}, column {}", l.line(), l.column()));
-            return CheckReport::invalid(
-                &config_path,
-                0,
-                CheckErrorKind::InvalidYaml,
-                location,
-            );
+            return CheckReport::invalid(input, 0, CheckErrorKind::InvalidYaml, location);
         }
     };
 
     match validation::validate_config(&config) {
-        Ok(()) => CheckReport::valid(&config_path, config.projects.len()),
+        Ok(()) => CheckReport::valid(input, config.projects.len()),
         Err(issue) => CheckReport::invalid(
-            &config_path,
+            input,
             config.projects.len(),
             issue.kind.into(),
             Some(issue.location),
@@ -600,5 +650,238 @@ projects:
         let (_dir2, bad) = write_config("projects: []\n");
         assert!(!check(Some(&bad)).valid);
         assert!(super::super::load(Some(&bad)).is_err());
+    }
+
+    // --- stdin (`--stdin`) ---
+
+    const VALID_YAML: &str = r#"
+projects:
+  - name: piped
+    work_dir: /nonexistent/deployment/only
+    agents:
+      - name: claude
+        backend: claude
+        mode: yolo
+    default_agent: claude
+    platforms:
+      - type: telegram
+        options:
+          token: "dummy"
+"#;
+
+    /// Reader that fails mid-stream, standing in for a broken pipe.
+    struct FailingReader;
+
+    impl std::io::Read for FailingReader {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "pipe closed"))
+        }
+    }
+
+    #[test]
+    fn piped_valid_config_passes_and_is_labelled_stdin() {
+        let report = check_reader(VALID_YAML.as_bytes());
+        assert!(report.valid, "{:?}", report.error);
+        assert_eq!(report.projects, 1);
+        assert!(report.error.is_none());
+        assert_eq!(report.schema, SCHEMA);
+        assert_eq!(report.config_path, STDIN_INPUT);
+    }
+
+    #[test]
+    fn piped_input_never_consults_the_default_path() {
+        // No path is resolved at all for stdin: the same bytes must verdict the
+        // same on a host with no ~/.agentbridge/config.yaml as on one with a
+        // broken config sitting there.
+        let report = check_reader("projects: []\n".as_bytes());
+        assert_eq!(report.config_path, STDIN_INPUT);
+        assert_eq!(report.error.unwrap().kind, CheckErrorKind::NoProjects);
+    }
+
+    #[test]
+    fn piped_empty_input_fails_without_leaking_or_defaulting() {
+        // An empty pipe must never pass and must never silently fall back to
+        // the config file on disk. Which failure it is depends on the flavour of
+        // emptiness — bare `""` deserializes into an all-defaults config and
+        // trips the semantic rule, whitespace-only input trips the parser — so
+        // the test pins the properties that matter, not one kind.
+        for empty in ["", "   \n\n\t", "---\n", "# only a comment\n"] {
+            let report = check_reader(empty.as_bytes());
+            assert!(!report.valid, "empty input passed: {:?}", empty);
+            assert_eq!(report.projects, 0);
+            assert_eq!(report.config_path, STDIN_INPUT);
+            let err = report.error.expect("a failed check must carry a diagnostic");
+            assert!(
+                matches!(
+                    err.kind,
+                    CheckErrorKind::NoProjects | CheckErrorKind::InvalidYaml
+                ),
+                "unexpected kind {:?} for {:?}",
+                err.kind,
+                empty
+            );
+
+            // Same verdict as handing the same bytes over as a file.
+            let (_dir, path) = write_config(empty);
+            assert_eq!(check(Some(&path)).error, Some(err), "input: {:?}", empty);
+        }
+    }
+
+    #[test]
+    fn piped_malformed_yaml_reports_position_only() {
+        let piped = format!(
+            r#"
+projects:
+  - name: broken
+    platforms: [
+    token: "{}"
+"#,
+            SECRET
+        );
+        let report = check_reader(piped.as_bytes());
+        assert!(!report.valid);
+        let json = report.to_json().unwrap();
+        assert!(!json.contains(SECRET), "leaked secret: {}", json);
+        let err = report.error.unwrap();
+        assert_eq!(err.kind, CheckErrorKind::InvalidYaml);
+        assert!(err.location.is_some());
+    }
+
+    #[test]
+    fn piped_non_utf8_input_is_unreadable_and_echoes_nothing() {
+        // A lone 0xFF cannot start a UTF-8 sequence; the surrounding bytes
+        // spell out a token that must not reach the report.
+        let mut bytes = b"token: ".to_vec();
+        bytes.extend_from_slice(SECRET.as_bytes());
+        bytes.push(0xFF);
+
+        let report = check_reader(&bytes[..]);
+        assert!(!report.valid);
+        assert_eq!(report.projects, 0);
+        assert_eq!(report.config_path, STDIN_INPUT);
+        let json = report.to_json().unwrap();
+        assert!(!json.contains(SECRET), "leaked secret: {}", json);
+        let err = report.error.unwrap();
+        assert_eq!(err.kind, CheckErrorKind::ConfigUnreadable);
+        assert_eq!(err.location, None);
+    }
+
+    #[test]
+    fn unreadable_pipe_is_reported_as_unreadable() {
+        let report = check_reader(FailingReader);
+        assert!(!report.valid);
+        assert_eq!(report.config_path, STDIN_INPUT);
+        let err = report.error.unwrap();
+        assert_eq!(err.kind, CheckErrorKind::ConfigUnreadable);
+        assert_eq!(err.location, None);
+    }
+
+    #[test]
+    fn piped_semantic_error_matches_the_file_verdict() {
+        // Same bytes through both paths must agree on kind and location, so a
+        // pipeline check cannot pass what a file check would reject.
+        let yaml = r#"
+projects:
+  - name: dup
+    work_dir: /tmp
+    agents:
+      - name: claude
+        backend: claude
+      - name: claude
+        backend: claude
+    platforms:
+      - type: telegram
+        options:
+          token: "t"
+"#;
+        let (_dir, path) = write_config(yaml);
+        let from_file = check(Some(&path));
+        let from_stdin = check_reader(yaml.as_bytes());
+
+        assert_eq!(from_stdin.valid, from_file.valid);
+        assert_eq!(from_stdin.projects, from_file.projects);
+        assert_eq!(from_stdin.error, from_file.error);
+        assert_eq!(from_stdin.config_path, STDIN_INPUT);
+        assert_eq!(from_file.config_path, path);
+    }
+
+    #[test]
+    fn piped_and_file_checks_agree_across_every_outcome() {
+        for yaml in [
+            VALID_YAML,
+            "projects: []\n",
+            "projects:\n  - name: \"\"\n    platforms:\n      - type: telegram\n",
+            "projects:\n  - name: noplat\n    platforms: []\n",
+            "webhook:\n  port: \"not-a-port\"\nprojects: []\n",
+        ] {
+            let (_dir, path) = write_config(yaml);
+            let from_file = check(Some(&path));
+            let from_stdin = check_reader(yaml.as_bytes());
+            assert_eq!(
+                from_stdin.valid, from_file.valid,
+                "verdict differs for: {}",
+                yaml
+            );
+            assert_eq!(
+                from_stdin.error, from_file.error,
+                "diagnostic differs for: {}",
+                yaml
+            );
+        }
+    }
+
+    #[test]
+    fn piped_semantic_error_output_excludes_secrets_and_names() {
+        let piped = format!(
+            r#"
+projects:
+  - name: leaky-project
+    work_dir: /home/someone/private/repo
+    agents:
+      - name: leaky-agent
+        backend: claude
+      - name: leaky-agent
+        backend: claude
+    platforms:
+      - type: telegram
+        options:
+          token: "{}"
+          admin_password: "hunter2"
+"#,
+            SECRET
+        );
+        let report = check_reader(piped.as_bytes());
+        let json = report.to_json().unwrap();
+        let text = report.to_text();
+        for rendering in [&json, &text] {
+            for leaked in [SECRET, "hunter2", "leaky-project", "leaky-agent", "private/repo"] {
+                assert!(
+                    !rendering.contains(leaked),
+                    "rendering leaked {:?}: {}",
+                    leaked,
+                    rendering
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn piped_report_serializes_all_documented_fields() {
+        let json = check_reader(VALID_YAML.as_bytes()).to_json().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = parsed.as_object().unwrap();
+        assert_eq!(obj.len(), 5, "unexpected report shape: {}", json);
+        assert_eq!(obj["schema"], SCHEMA);
+        assert_eq!(obj["valid"], true);
+        assert_eq!(obj["projects"], 1);
+        assert!(obj["error"].is_null());
+        assert_eq!(obj["config_path"], STDIN_INPUT);
+    }
+
+    #[test]
+    fn piped_text_rendering_names_stdin_as_the_input() {
+        let text = check_reader(VALID_YAML.as_bytes()).to_text();
+        assert!(text.contains("config check: ok"));
+        assert!(text.contains(STDIN_INPUT), "{}", text);
     }
 }

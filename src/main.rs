@@ -25,7 +25,7 @@ mod sync;
 mod transcript;
 mod webhook;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 use std::io::{self, Write};
@@ -110,6 +110,9 @@ enum ConfigAction {
         /// Print a single machine-readable JSON object instead of text
         #[arg(long)]
         json: bool,
+        /// Read the config from standard input instead of a file
+        #[arg(long)]
+        stdin: bool,
     },
 }
 
@@ -177,7 +180,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Init => run_init().await,
         Commands::Doctor => run_doctor(cli.config).await,
         Commands::Config { action } => match action {
-            ConfigAction::Check { json } => run_config_check(cli.config, json),
+            ConfigAction::Check { json, stdin } => run_config_check(cli.config, json, stdin),
         },
         Commands::HookInstall { port } => run_hook_install(cli.config, port).await,
         Commands::Daemon { action } => run_daemon(action),
@@ -830,15 +833,64 @@ fn prompt_input(prompt: &str) -> anyhow::Result<String> {
     Ok(input.trim().to_string())
 }
 
+/// Where `agentbridge config check` should read the config from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CheckInput {
+    /// The path from `--config`, or the default path when `None`.
+    File(Option<String>),
+    /// Standard input, under `--stdin`.
+    Stdin,
+}
+
+/// Resolve the input flags of `config check` into a single source.
+///
+/// `--stdin` and an explicit `--config` are mutually exclusive: serving one
+/// would silently ignore the other, and a check that quietly validated a
+/// different config than the caller named is worse than no check. `--config` is
+/// a global flag that clap accepts on either side of the subcommand, so the
+/// conflict is decided from the parsed values and is therefore order-independent.
+fn resolve_check_input(
+    config_path: Option<String>,
+    stdin: bool,
+) -> Result<CheckInput, &'static str> {
+    match (stdin, config_path) {
+        (true, Some(_)) => Err("the argument '--stdin' cannot be used with '--config <CONFIG>'"),
+        (true, None) => Ok(CheckInput::Stdin),
+        (false, path) => Ok(CheckInput::File(path)),
+    }
+}
+
 /// Offline config validation. Prints one report and exits 0 when the config is
-/// valid, 1 for every config error (missing or unreadable file, malformed YAML
+/// valid, 1 for every config error (missing or unreadable input, malformed YAML
 /// or wrong field types, semantic problems). With `--json` the report is exactly
 /// one JSON object on stdout for either outcome, so CI can parse it blindly.
 ///
+/// With `--stdin` the config is read from standard input and reported as
+/// `<stdin>`, which lets a pipeline validate generated YAML without writing a
+/// temporary file. Rules and diagnostics are identical to the file path.
+///
 /// Nothing here touches the network, looks for agent executables, writes files
-/// or starts a service: the check is about the file, not about the host.
-fn run_config_check(config_path: Option<String>, json: bool) -> anyhow::Result<()> {
-    let report = config::check::check(config_path.as_deref());
+/// or starts a service: the check is about the config, not about the host.
+fn run_config_check(
+    config_path: Option<String>,
+    json: bool,
+    stdin: bool,
+) -> anyhow::Result<()> {
+    let input = match resolve_check_input(config_path, stdin) {
+        Ok(input) => input,
+        // A mis-invocation is not a verdict about a config, so it exits as a
+        // clap usage error (code 2, message on stderr) and prints no report —
+        // stdout stays empty rather than carrying a JSON object that would
+        // claim a config had been checked.
+        Err(message) => Cli::command()
+            .error(clap::error::ErrorKind::ArgumentConflict, message)
+            .exit(),
+    };
+
+    let report = match input {
+        CheckInput::File(path) => config::check::check(path.as_deref()),
+        CheckInput::Stdin => config::check::check_stdin(),
+    };
 
     if json {
         println!("{}", report.to_json()?);
@@ -1187,8 +1239,11 @@ mod cli_tests {
         assert_eq!(cli.config.as_deref(), Some("/tmp/c.yaml"));
         match cli.command {
             Some(Commands::Config {
-                action: ConfigAction::Check { json },
-            }) => assert!(!json, "json must default to off"),
+                action: ConfigAction::Check { json, stdin },
+            }) => {
+                assert!(!json, "json must default to off");
+                assert!(!stdin, "stdin must default to off");
+            }
             _ => panic!("expected config check"),
         }
     }
@@ -1198,8 +1253,11 @@ mod cli_tests {
         let cli = parse(&["agentbridge", "config", "check", "--json"]);
         match cli.command {
             Some(Commands::Config {
-                action: ConfigAction::Check { json },
-            }) => assert!(json),
+                action: ConfigAction::Check { json, stdin },
+            }) => {
+                assert!(json);
+                assert!(!stdin);
+            }
             _ => panic!("expected config check"),
         }
     }
@@ -1222,5 +1280,86 @@ mod cli_tests {
     fn config_requires_a_known_action() {
         assert!(Cli::try_parse_from(["agentbridge", "config"]).is_err());
         assert!(Cli::try_parse_from(["agentbridge", "config", "lint"]).is_err());
+    }
+
+    // --- `config check --stdin` ---
+
+    /// Parse a `config check` invocation and resolve its input source the way
+    /// `run_config_check` does.
+    fn resolve(args: &[&str]) -> Result<CheckInput, &'static str> {
+        let cli = parse(args);
+        match cli.command {
+            Some(Commands::Config {
+                action: ConfigAction::Check { stdin, .. },
+            }) => resolve_check_input(cli.config, stdin),
+            _ => panic!("expected config check"),
+        }
+    }
+
+    #[test]
+    fn config_check_accepts_stdin_flag() {
+        let cli = parse(&["agentbridge", "config", "check", "--stdin"]);
+        assert_eq!(cli.config, None);
+        match cli.command {
+            Some(Commands::Config {
+                action: ConfigAction::Check { json, stdin },
+            }) => {
+                assert!(stdin);
+                assert!(!json);
+            }
+            _ => panic!("expected config check"),
+        }
+    }
+
+    #[test]
+    fn stdin_and_json_combine() {
+        assert_eq!(
+            resolve(&["agentbridge", "config", "check", "--stdin", "--json"]),
+            Ok(CheckInput::Stdin)
+        );
+        assert_eq!(
+            resolve(&["agentbridge", "config", "check", "--json", "--stdin"]),
+            Ok(CheckInput::Stdin)
+        );
+    }
+
+    #[test]
+    fn stdin_with_explicit_config_is_rejected_in_either_order() {
+        for args in [
+            &["agentbridge", "--config", "/tmp/c.yaml", "config", "check", "--stdin"][..],
+            &["agentbridge", "config", "check", "--stdin", "--config", "/tmp/c.yaml"][..],
+            &["agentbridge", "config", "check", "--config", "/tmp/c.yaml", "--stdin"][..],
+            &["agentbridge", "--config", "/tmp/c.yaml", "config", "check", "--stdin", "--json"][..],
+        ] {
+            let resolved = resolve(args);
+            assert!(
+                resolved.is_err(),
+                "expected rejection for {:?}, got {:?}",
+                args,
+                resolved
+            );
+        }
+    }
+
+    #[test]
+    fn file_input_is_unchanged_without_stdin() {
+        // The default path stays implicit (resolved later by the check itself)
+        // and an explicit --config still wins, exactly as before --stdin existed.
+        assert_eq!(
+            resolve(&["agentbridge", "config", "check"]),
+            Ok(CheckInput::File(None))
+        );
+        assert_eq!(
+            resolve(&["agentbridge", "config", "check", "--json"]),
+            Ok(CheckInput::File(None))
+        );
+        assert_eq!(
+            resolve(&["agentbridge", "--config", "/tmp/c.yaml", "config", "check"]),
+            Ok(CheckInput::File(Some("/tmp/c.yaml".to_string())))
+        );
+        assert_eq!(
+            resolve(&["agentbridge", "config", "check", "--config", "/tmp/c.yaml"]),
+            Ok(CheckInput::File(Some("/tmp/c.yaml".to_string())))
+        );
     }
 }

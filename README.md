@@ -302,6 +302,10 @@ and pre-commit hooks. Use `doctor` instead when you want the host checked too
 it just generated without writing a temporary file:
 
 ```bash
+# a pipeline reports its LAST command's status, so without pipefail a producer
+# that dies after emitting valid-looking YAML is hidden by a passing check
+set -o pipefail
+
 # validate generated config without touching disk
 render-config | agentbridge config check --stdin
 
@@ -311,6 +315,14 @@ render-config | agentbridge config check --stdin --json | jq -e '.valid'
 # check a file without letting agentbridge resolve the path
 cat ./config.yaml | agentbridge config check --stdin
 ```
+
+`set -o pipefail` is what makes the gate trustworthy. The check only ever sees
+the bytes it was handed: a generator that emits a valid prefix and then fails
+produces YAML that is genuinely loadable, so `valid` is `true`, `jq -e` exits 0
+and — without pipefail — so does the pipeline, hiding the failed producer.
+With it, the producer's exit code wins and CI stops. Bash and zsh support it;
+in a POSIX `sh` script, capture the config in a variable (or a temp file) and
+check the generator's status before piping.
 
 Rules, diagnostics and exit codes are identical to the file path; only
 `config_path` differs, reading `<stdin>`. The default path is never consulted, so
